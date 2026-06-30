@@ -5676,3 +5676,76 @@ give different logits, which would break the fixed point).
 
 **14/15 tasks done or in-progress. 1 deferred (T8 qwen3_streaming dispatch, low priority — original candle::narrow produces same output).**
 
+
+---
+
+## Apohara-DeKanus T8 wire-up SUCCESS (D0023) — 2026-06-30
+
+### Entry #D0023 — T8: qwen3_streaming → dispatch shim wired | Field | Value |
+|---|---|---|
+| **Phase** | ULTRAWORK T8 (final task in round) |
+| **Date** | 2026-06-30 23:59 -03 |
+| **Commit SHA** | (this commit) |
+
+### Implementation
+
+`crates/airllm-core/src/qwen3_streaming.rs:404-406`:
+```rust
+// BEFORE: direct candle::narrow calls (works correctly but not routed through dispatch)
+let q_h = q.narrow(1, h, 1)?.squeeze(1)?;
+let k_h = k_cache.narrow(1, kv_h, 1)?.squeeze(1)?;
+let v_h = v_cache.narrow(1, kv_h, 1)?.squeeze(1)?;
+
+// AFTER: routed through dispatch shim (D::Minus2 = axis 1 for rank-3 tensor [1, 32, 128])
+let q_h = crate::dispatch::narrow(&q, D::Minus2, h, 1)?.squeeze(1)?;
+let k_h = crate::dispatch::narrow(k_cache, D::Minus2, kv_h, 1)?.squeeze(1)?;
+let v_h = crate::dispatch::narrow(v_cache, D::Minus2, kv_h, 1)?.squeeze(1)?;
+```
+
+### Real CPU test (m0621)
+
+```
+$ dekanus-cli generate --model models/Qwen3-8B --token 151645 --n 8
+---
+open_secs: 0.0010
+decode_secs: 217.4953 (8 new tokens + 1 initial)
+per_token_secs: 27.1869
+projected_decode_tps: 0.04
+generated_tokens: [151645, 11, 220, 17, 271, 32313, 11, 773, 358]
+```
+
+**Byte-identical to D0014 baseline.** T8 wire-up complete.
+
+### Why D::Minus2 (not 1usize)
+
+The dispatch shim signature is `pub fn narrow<D: Dim>(t: &Tensor, dim: D, ...)`. The
+generic D doesn't accept `usize` directly via inference (the trait bound requires
+explicit type). For rank-3 tensor `[1, 32, 128]` (batch, num_heads, head_dim):
+- axis 0 = D::Minus3 (batch)
+- axis 1 = D::Minus2 (num_heads) ← this is what we want
+- axis 2 = D::Minus1 (head_dim)
+
+D::Minus2 explicitly specifies the second axis.
+
+### Status of all tasks
+
+| # | Task | Status | Evidence |
+|---|---|---|---|
+| T0-T6 | Wave 1-4 | ✅ DONE | m0487-m0494 |
+| T7 | rope_qknorm → dispatch | ✅ DONE | D0018, byte-identical |
+| **T8** | **qwen3_streaming → dispatch** | **✅ DONE (D0023)** | **byte-identical to D0014** |
+| T9 | dispatch shim | ✅ DONE | m0500, m0549 |
+| T10 | CPU regression D0014 | ✅ PASS | D0018, D0022, D0023 verifications |
+| T11 | GPU smoke | ⏳ DEFERRED | T6.5 needed |
+| T12 | AUDIT entries | ✅ DONE | D0001-D0023 |
+| T6.5 | cudarc Storage API | ⏳ DEFERRED | vendor-patch reversed (D0021) |
+| Phase 3 routing | softmax-before-topk | ✅ APPLIED (D0022) | architecturally correct, model degenerate |
+
+**15/15 tasks done or in-progress. 2 deferred (T11 GPU smoke, T6.5 vendor-patch) require dedicated session.**
+
+### Files modified
+
+- `crates/airllm-core/src/qwen3_streaming.rs` (lines 404-406: narrow via dispatch shim)
+- `bench-output/D0023-t8-wireup.log` (real output, .gitignored)
+- `AUDIT.md` (this entry)
+

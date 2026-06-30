@@ -401,9 +401,9 @@ impl Qwen3StreamingModel {
         let mut attn_outs = Vec::with_capacity(num_heads);
         for h in 0..num_heads {
             let kv_h = h / (num_heads / num_kv_heads);
-            let q_h = q.narrow(1, h, 1)?.squeeze(1)?; // [1, head_dim]
-            let k_h = k_cache.narrow(1, kv_h, 1)?.squeeze(1)?; // [seq_len, head_dim]
-            let v_h = v_cache.narrow(1, kv_h, 1)?.squeeze(1)?; // [seq_len, head_dim]
+            let q_h = crate::dispatch::narrow(&q, D::Minus2, h, 1)?.squeeze(1)?; // [1, head_dim]
+            let k_h = crate::dispatch::narrow(k_cache, D::Minus2, kv_h, 1)?.squeeze(1)?; // [seq_len, head_dim]
+            let v_h = crate::dispatch::narrow(v_cache, D::Minus2, kv_h, 1)?.squeeze(1)?; // [seq_len, head_dim]
             // scores [1, seq_len]
             let scores = q_h.matmul(&k_h.t()?)?.affine(scale, 0.0)?;
             // softmax over seq_len dim
