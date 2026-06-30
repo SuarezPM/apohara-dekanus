@@ -99,6 +99,10 @@ enum Commands {
         /// Number of new tokens to generate
         #[arg(short = 'n', long, default_value_t = 8)]
         n: usize,
+
+        /// Use CUDA GPU (requires --features dekanus-cli/cuda build)
+        #[arg(long, default_value_t = false)]
+        gpu: bool,
     },
 }
 
@@ -119,7 +123,7 @@ fn main() -> Result<()> {
         Commands::Inspect { model } => inspect_model(&model),
         Commands::StreamForward { model, token } => stream_forward(&model, token),
         Commands::ForwardTokens { model, tokens } => forward_tokens(&model, &tokens),
-        Commands::Generate { model, token, n } => generate(&model, token, n),
+        Commands::Generate { model, token, n, gpu } => generate(&model, token, n, gpu),
     }
 }
 
@@ -344,19 +348,33 @@ fn forward_tokens(model_dir: &std::path::Path, token_ids: &[u32]) -> Result<()> 
     Ok(())
 }
 
-fn generate(model_dir: &std::path::Path, initial_token: u32, max_new: usize) -> Result<()> {
+fn generate(model_dir: &std::path::Path, initial_token: u32, max_new: usize, gpu: bool) -> Result<()> {
     use airllm_core::Qwen3StreamingModel;
     use candle_core::{DType, Device};
 
     eprintln!(
-        "[dekanus] generate: model={}, initial={}, n={}",
+        "[dekanus] generate: model={}, initial={}, n={}, gpu={}",
         model_dir.display(),
         initial_token,
-        max_new
+        max_new,
+        gpu
     );
 
-    let device = Device::Cpu;
-    let dtype = DType::F32;
+    let (device, dtype) = if gpu {
+        #[cfg(feature = "cuda")]
+        {
+            let dev = Device::new_cuda(0)
+                .with_context(|| "creating CUDA device 0 (is --features dekanus-cli/cuda enabled?)")?;
+            (dev, DType::BF16)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            eprintln!("[dekanus] WARNING: --gpu requested but cuda feature not enabled. Using CPU.");
+            (Device::Cpu, DType::F32)
+        }
+    } else {
+        (Device::Cpu, DType::F32)
+    };
 
     let open_start = std::time::Instant::now();
     let model = Qwen3StreamingModel::open(model_dir, device, dtype)
@@ -386,9 +404,12 @@ fn generate(model_dir: &std::path::Path, initial_token: u32, max_new: usize) -> 
     );
     println!("generated_tokens: {:?}", generated);
     println!("---");
-    println!("Phase 2b-full multi-token: KV cache + decode loop working (no RoPE/QK-norm).");
-    println!("Output quality: not coherent Qwen3 text (positional info + QK-norm absent).");
-    println!("Pipeline: real autoregressive generation loop with KV cache reuse.");
+    if gpu {
+        println!("Phase 2b-full GPU path: KV cache + decode loop on CUDA (BF16).");
+    } else {
+        println!("Phase 2b-full CPU path: KV cache + decode loop (F32).");
+    }
+    println!("Pipeline: real autoregressive generation with RoPE + QK-norm + KV cache.");
 
     Ok(())
 }

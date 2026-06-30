@@ -74,6 +74,8 @@ impl RoPETables {
 }
 
 /// QK-norm: per-head RMSNorm on Q or K (Qwen3-specific).
+/// Uses rms_norm_cuda (CUDA-compatible via mean/sqr/sqrt/div/mul primitives).
 pub fn qk_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-    Ok(candle_nn::ops::rms_norm(x, weight, eps)?)
+    use crate::rms_norm_cuda::rms_norm_cuda;
+    Ok(rms_norm_cuda(x, weight, eps as f64)?)
 }

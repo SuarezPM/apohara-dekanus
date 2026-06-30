@@ -23,6 +23,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::rms_norm;
 
 use crate::layer_stream_v2::LayerStreamedBuilder;
+use crate::rms_norm_cuda::rms_norm_cuda;
 use crate::rope_qknorm::{qk_norm, RoPETables};
 
 /// Minimal streaming Qwen3 model: embed + N simplified layers + lm_head.
@@ -213,7 +214,7 @@ pub fn forward_layer(&self, layer_idx: usize, hidden_states: &Tensor) -> Result<
         .builder
         .get_tensor(&input_ln_name)
         .with_context(|| format!("loading {}", input_ln_name))?;
-    let pre_normed = rms_norm(hidden_states, &ln_weight, 1e-6)
+    let pre_normed = rms_norm_cuda(hidden_states, &ln_weight, 1e-6)
         .with_context(|| "pre_attention RMSNorm")?;
     drop(ln_weight);
 
@@ -224,7 +225,7 @@ pub fn forward_layer(&self, layer_idx: usize, hidden_states: &Tensor) -> Result<
         .builder
         .get_tensor(&post_ln_name)
         .with_context(|| format!("loading {}", post_ln_name))?;
-    let post_normed = rms_norm(&hidden_after_attn, &post_ln, 1e-6)
+    let post_normed = rms_norm_cuda(&hidden_after_attn, &post_ln, 1e-6)
         .with_context(|| "post_attention RMSNorm")?;
     drop(post_ln);
 
@@ -260,7 +261,7 @@ pub fn forward_layer(&self, layer_idx: usize, hidden_states: &Tensor) -> Result<
             .builder
             .get_tensor("model.norm.weight")
             .with_context(|| "loading model.norm.weight")?;
-        let normed = rms_norm(&hidden, &final_norm, 1e-6)?;
+        let normed = rms_norm_cuda(&hidden, &final_norm, 1e-6)?;
         drop(final_norm);
 
         self.lm_head(&normed)
@@ -321,7 +322,7 @@ impl Qwen3StreamingModel {
             .builder
             .get_tensor("model.norm.weight")
             .with_context(|| "loading model.norm.weight")?;
-        let normed = rms_norm(&hidden, &final_norm, 1e-6)?;
+        let normed = rms_norm_cuda(&hidden, &final_norm, 1e-6)?;
         drop(final_norm);
 
         self.lm_head(&normed)
@@ -349,7 +350,7 @@ impl Qwen3StreamingModel {
 
         // Pre-attention RMSNorm
         let ln_w = self.builder.get_tensor(&input_ln_name)?;
-        let pre_normed = rms_norm(hidden_states, &ln_w, 1e-6)?;
+        let pre_normed = rms_norm_cuda(hidden_states, &ln_w, 1e-6)?;
         drop(ln_w);
 
         // Q/K/V projections
@@ -427,7 +428,7 @@ impl Qwen3StreamingModel {
 
         // Post-attention RMSNorm + MLP (unchanged from single-token version)
         let post_ln = self.builder.get_tensor(&post_ln_name)?;
-        let post_normed = rms_norm(&hidden_after_attn, &post_ln, 1e-6)?;
+        let post_normed = rms_norm_cuda(&hidden_after_attn, &post_ln, 1e-6)?;
         drop(post_ln);
 
         let mlp_out = self.mlp_block(layer_idx, &post_normed)?;
