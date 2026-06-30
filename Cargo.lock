@@ -600,6 +600,7 @@ dependencies = [
  "airllm-core",
  "anyhow",
  "audit-honesty",
+ "candle-core",
  "chrono",
  "clap",
  "dekanus-llmlingua2",

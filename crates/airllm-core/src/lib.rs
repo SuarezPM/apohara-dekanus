@@ -8,10 +8,12 @@
 
 pub mod config;
 pub mod layer_stream;
+pub mod layer_stream_v2;
 pub mod pinned_buffer;
 pub mod qwen3_runner;
 
 pub use config::EngineConfig;
 pub use layer_stream::{LayerStream, LayerShard};
+pub use layer_stream_v2::LayerStreamedBuilder;
 pub use pinned_buffer::PinnedHostBuffer;
 pub use qwen3_runner::{Qwen3Runner, Qwen3Variant, RunConfig, RunOutput};

@@ -56,6 +56,13 @@ enum Commands {
 
     /// Print version + hardware fingerprint + AUDIT.md head
     Info,
+
+    /// Inspect model files (shards, tensors, sizes) via layer-streaming reader
+    Inspect {
+        /// Model directory
+        #[arg(short, long)]
+        model: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -72,6 +79,7 @@ fn main() -> Result<()> {
         } => run_inference(model, prompt, max_new_tokens, temperature, variant, gpu, audit),
         Commands::Doctor => doctor(),
         Commands::Info => info(),
+        Commands::Inspect { model } => inspect_model(&model),
     }
 }
 
@@ -175,6 +183,60 @@ fn info() -> Result<()> {
     println!("                   dekanus-quant-kv, dekanus-llmlingua2, dekanus-rag,");
     println!("                   dekanus-romy, audit-honesty");
     println!("Phase: 1b (Qwen3 dense forward pass via candle-transformers)");
+    Ok(())
+}
+
+fn inspect_model(model_dir: &std::path::Path) -> Result<()> {
+    use airllm_core::LayerStreamedBuilder;
+    use candle_core::{DType, Device};
+
+    eprintln!("[dekanus] inspect: {}", model_dir.display());
+    let start = std::time::Instant::now();
+
+    let device = Device::Cpu;
+    let dtype = DType::BF16;
+
+    let builder = LayerStreamedBuilder::open(model_dir, device, dtype)
+        .with_context(|| format!("opening model dir {}", model_dir.display()))?;
+
+    let open_secs = start.elapsed().as_secs_f64();
+    let total_bytes = builder.total_bytes();
+    let total_gib = total_bytes as f64 / (1024.0_f64).powi(3);
+
+    println!("---");
+    println!("model_dir: {}", model_dir.display());
+    println!("shard_count: {}", builder.shard_count());
+    println!("tensor_count: {}", builder.tensor_count());
+    println!("total_bytes: {} ({:.3} GiB)", total_bytes, total_gib);
+    println!("open_secs: {:.4}", open_secs);
+    println!("---");
+
+    // Read a single tensor (layer 0 attention q_proj) to verify per-tensor lazy access
+    let sample_tensors = [
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.35.self_attn.o_proj.weight",
+        "lm_head.weight",
+    ];
+    for name in &sample_tensors {
+        let start = std::time::Instant::now();
+        let t = builder
+            .get_tensor(name)
+            .with_context(|| format!("reading tensor '{}'", name))?;
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "tensor: {:60} shape={:?} dtype={:?} read_ms={:.2}",
+            name,
+            t.shape().dims(),
+            t.dtype(),
+            elapsed_ms
+        );
+    }
+
+    println!("---");
+    println!("Phase 2a verification: layer-streamed reader works (lazy tensor access).");
+    println!("Phase 2b next: custom Qwen3 forward pass that uses this builder per-layer.");
+
     Ok(())
 }
 

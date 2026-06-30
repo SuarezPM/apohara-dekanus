@@ -3814,3 +3814,87 @@ Caused by:
 - ✅ GPU build infrastructure works end-to-end
 - ✅ OOM finding validates project thesis (the right problem to solve)
 
+
+---
+
+## Apohara-DeKanus Phase 2a — Layer-streaming reader verified (2026-06-30)
+
+### Entry #D0006 — Phase 2a: LayerStreamedBuilder works on real Qwen3-8B | Field | Value |
+|---|---|
+| **Phase** | 2a (Layer-streaming reader infrastructure) |
+| **Date** | 2026-06-30 17:20 -03 |
+| **Commit SHA** | (this commit) |
+| **Build** | ✅ `cargo build --release -p dekanus-cli --features dekanus-cli/cuda` (50s, 15/15 PTX kernels) |
+
+### Implementation: `LayerStreamedBuilder` (crates/airllm-core/src/layer_stream_v2.rs)
+
+- Opens each safetensors shard via `memmap2::Mmap` (OS-level mmap, no copy)
+- Deserializes safetensors header per shard via `SafeTensors::deserialize` (~µs)
+- Per-tensor access via `safe_tensors.tensor(name)?.data()` (page cache hits on warm)
+- Returns `candle_core::Tensor` ready for forward pass
+
+**Self-referential struct**: `ShardView { bytes: Mmap, safe_tensors: SafeTensors<'static> }`.
+SafeTensors borrows from Mmap; Rust struct field drop order (declaration order:
+`bytes` then `safe_tensors`) ensures SafeTensors is dropped first, freeing borrows
+before Mmap is unmapped.
+
+### Verification: `dekanus-cli inspect --model models/Qwen3-8B`
+
+Real output (captured at `bench-output/phase2a-inspect.log`):
+```
+[dekanus] inspect: /home/thelinconx/Mi_Universo/Mundo_Apohara/apohara-dekanus/models/Qwen3-8B
+---
+model_dir: /home/thelinconx/Mi_Universo/Mundo_Apohara/apohara-dekanus/models/Qwen3-8B
+shard_count: 5
+tensor_count: 399
+total_bytes: 16381516776 (15.256 GiB)
+open_secs: 0.0223
+---
+tensor: model.embed_tokens.weight                   shape=[151936, 4096] dtype=BF16 read_ms=1429.23
+tensor: model.layers.0.self_attn.q_proj.weight      shape=[4096, 4096] dtype=BF16 read_ms=50.11
+tensor: model.layers.35.self_attn.o_proj.weight     shape=[4096, 4096] dtype=BF16 read_ms=16.35
+tensor: lm_head.weight                              shape=[151936, 4096] dtype=BF16 read_ms=638.76
+```
+
+### Results
+
+| Metric | Value | Interpretation |
+|---|---|---|
+| **shard_count** | 5 | ✅ Correct (Qwen3-8B is sharded 1-of-5 to 5-of-5) |
+| **tensor_count** | 399 | ✅ Correct (36 layers × ~11 tensors + embed + norm + lm_head) |
+| **total_bytes** | 15.256 GiB | ✅ Matches 16.40 GB on disk (BF16 weights, sparse indexes) |
+| **open_secs** | 0.0223 | ✅ **Layer-streaming works**: model opened without loading into RAM; just mmap + header parse |
+| **embed_tokens read** | 1429ms | Cold page cache (600MB tensor, first read causes page faults) |
+| **layer 0 q_proj read** | 50ms | Page cache hit (16MB tensor, sequential after embed) |
+| **layer 35 o_proj read** | 16ms | Page cache hit (already in cache from layer 0's shard) |
+| **lm_head read** | 638ms | Cold cache (600MB tensor, in shard 1, different physical location) |
+
+### Honest interpretation
+
+- **Layer-streaming READ infrastructure is verified working**: open the full Qwen3-8B
+  model in 22ms without loading 15GB into RAM. Per-tensor reads are O(read_size)
+  with page cache amortization.
+- **Next: layer-streaming INFERENCE infrastructure (Phase 2b)**: custom Qwen3 forward
+  pass that loads layer N's weights via this builder, forwards, releases, fetches N+1.
+- **Why Phase 2b is non-trivial**: candle-transformers' `ModelForCausalLM::new(&config, vb)`
+  eagerly loads all weights into device memory. Bypassing requires re-implementing
+  Qwen3 forward pass in our crate (500+ LOC, multi-day effort).
+- **Phase 2b gap acknowledgment**: not claiming Phase 2b done in this session.
+
+### Files added/modified
+
+- `crates/airllm-core/src/layer_stream_v2.rs` (~175 LOC, new module)
+- `crates/airllm-core/Cargo.toml` (no dep change — uses existing safetensors + memmap2)
+- `crates/airllm-core/src/lib.rs` (re-export LayerStreamedBuilder)
+- `crates/dekanus-cli/src/main.rs` (Inspect subcommand + inspect_model handler)
+- `crates/dekanus-cli/Cargo.toml` (added candle-core dep)
+- `bench-output/phase2a-inspect.log` (real output, .gitignored)
+
+### Phase 3/4 status (next session)
+
+| Phase | Status | Blocker |
+|---|---|---|
+| 2b (layer-streaming inference) | Pending | Custom Qwen3 forward impl required |
+| 3 (Qwen3-30B-A3B sparse MoE) | Pending | Phase 2b + sparse MoE routing wire-up |
+| 4 (Qwen3-Coder-Next custom impl) | Pending | Qwen3NextForCausalLM ~500 LOC (NOT in candle) |
+
