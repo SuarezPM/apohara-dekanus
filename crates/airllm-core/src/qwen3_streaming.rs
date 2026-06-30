@@ -23,7 +23,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::rms_norm;
 
 use crate::layer_stream_v2::LayerStreamedBuilder;
-use crate::rope_qknorm::RoPETables;
+use crate::rope_qknorm::{qk_norm, RoPETables};
 
 /// Minimal streaming Qwen3 model: embed + N simplified layers + lm_head.
 pub struct Qwen3StreamingModel {
@@ -370,6 +370,16 @@ impl Qwen3StreamingModel {
             .ok_or_else(|| anyhow::anyhow!("rope_tables not initialized"))?;
         let q = rope.apply(&q, position)?;
         let k_new = rope.apply(&k_new, position)?;
+
+        // Apply QK-norm (Qwen3-specific per-head RMSNorm on q and k)
+        let q_norm_name = format!("model.layers.{}.self_attn.q_norm.weight", layer_idx);
+        let k_norm_name = format!("model.layers.{}.self_attn.k_norm.weight", layer_idx);
+        let q_norm_w = self.builder.get_tensor(&q_norm_name)?;
+        let k_norm_w = self.builder.get_tensor(&k_norm_name)?;
+        let q = qk_norm(&q, &q_norm_w, 1e-6)?;
+        let k_new = qk_norm(&k_new, &k_norm_w, 1e-6)?;
+        drop(q_norm_w);
+        drop(k_norm_w);
 
         // Append to KV cache (concat along seq dim 0; k_new shape [1, kv_heads, head_dim] = [seq=1, ...])
         if kv_cache.keys[layer_idx].dim(0)? == 0 {
