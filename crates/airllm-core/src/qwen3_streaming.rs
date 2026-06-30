@@ -256,4 +256,18 @@ pub fn forward_layer(&self, layer_idx: usize, hidden_states: &Tensor) -> Result<
 
         self.lm_head(&normed)
     }
+
+    /// Forward multiple tokens (independent, no KV cache). Each token is processed
+    /// in isolation through all 36 layers. This is NOT autoregressive generation
+    /// (each step is independent, no history). For real generation, KV cache +
+    /// RoPE + QK-norm + decode loop needed (Phase 2b-full multi-token, deferred).
+    /// Returns Vec<logits> of length tokens.len().
+    pub fn forward_multi_token(&self, token_ids: &[u32]) -> Result<Vec<Tensor>> {
+        let mut all_logits = Vec::with_capacity(token_ids.len());
+        for &tid in token_ids {
+            let logits = self.forward_one_token(tid)?;
+            all_logits.push(logits);
+        }
+        Ok(all_logits)
+    }
 }

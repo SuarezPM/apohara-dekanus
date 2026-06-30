@@ -4262,3 +4262,82 @@ argmax_token: 11 (logit=13.463)
   rewrote forward_layer to call real attention + real MLP)
 - `bench-output/phase2b-stream-forward-real-attn.log` (real output, .gitignored)
 
+
+---
+
+## Apohara-DeKanus Phase 2b — Multi-token forward (no KV cache) (2026-06-30)
+
+### Entry #D0011 — Phase 2b: forward_multi_token on 6 inputs | Field | Value |
+|---|---|
+| **Phase** | 2b (multi-token forward, no KV cache — honest PoC) |
+| **Date** | 2026-06-30 18:35 -03 |
+| **Commit SHA** | (this commit) |
+| **Hardware** | CPU Ryzen 5 3600, 46Gi RAM, F32 |
+
+### Implementation: `Qwen3StreamingModel::forward_multi_token(&[u32]) -> Result<Vec<Tensor>>`
+
+Sequentially runs `forward_one_token` for each input token. Each token is
+processed independently through all 36 layers + lm_head.
+
+**Honest scope**:
+- ✅ Pipeline handles N tokens without crashes
+- ✅ Each token produces deterministic argmax (varies per token)
+- ❌ NOT autoregressive generation (each step independent, no KV cache, no history)
+- ❌ Output quality not meaningful for coherent text
+- ⏳ Phase 2b-full multi-token (KV cache + RoPE + QK-norm + decode loop) deferred
+
+### Real measurement (captured at `bench-output/phase2b-forward-tokens.log`)
+
+```
+$ dekanus-cli forward-tokens --model models/Qwen3-8B --tokens 151645,872,1531,13,40,1144
+[dekanus] opened in 0.0010s (n_layers=36, hidden=4096, vocab=151936)
+---
+tokens: [151645, 872, 1531, 13, 40, 1144]
+open_secs: 0.0010
+forward_secs: 159.2106
+per_token_secs: 26.5351
+projected_decode_tps: 0.04
+token[0]=151645 -> argmax=11 (logit=13.463)
+token[1]=872 -> argmax=25 (logit=13.036)
+token[2]=1531 -> argmax=67 (logit=11.658)
+token[3]=13 -> argmax=220 (logit=11.726)
+token[4]=40 -> argmax=67 (logit=13.748)
+token[5]=1144 -> argmax=11 (logit=12.632)
+```
+
+### Interpretation
+
+| Metric | Value | Notes |
+|---|---|---|
+| **forward_secs** | 159.21 | 6 tokens × ~26.5s each (≈ 6 × D0010 single-token 27s) |
+| **per_token_secs** | 26.53 | Consistent with single-token forward (27.03 in D0010) |
+| **projected_decode_tps** | 0.04 | 6 independent forward passes; no shared state |
+| **argmax per token** | varies | Deterministic per input (each token produces different prediction) |
+
+### Honest framing
+
+- **Each token processed independently**: forward_one_token for token[i] has
+  NO knowledge of token[0..i-1]. Output quality is meaningless for generation.
+- **No KV cache**: each layer recomputes its K/V from scratch for each token,
+  no history maintained.
+- **No RoPE**: positional encoding absent (only matters for sequence > 1 anyway).
+- **No QK-norm**: per-head RMSNorm on q/k absent.
+- **Total compute**: 6× single-token = 6× 27s = 162s (matches 159s within overhead).
+
+### Path to real multi-token generation
+
+Phase 2b-full multi-token requires:
+- KV cache (per-layer key/value tensor persistence + concat) ~100 LOC
+- Real SDPA with sequence > 1 (Q·K^T matrix, softmax, attention weighting) ~50 LOC
+- RoPE with position embeddings (precompute cos/sin tables) ~30 LOC
+- QK-norm with per-head weights (already have weight loading pattern) ~30 LOC
+- Decode loop: feed argmax back, accumulate KV cache ~80 LOC
+
+**Total Phase 2b-full multi-token: ~290 LOC.** Estimated effort: 3-6 hours focused.
+
+### Files modified
+
+- `crates/airllm-core/src/qwen3_streaming.rs` (added forward_multi_token method)
+- `crates/dekanus-cli/src/main.rs` (added ForwardTokens subcommand + handler)
+- `bench-output/phase2b-forward-tokens.log` (real output, .gitignored)
+

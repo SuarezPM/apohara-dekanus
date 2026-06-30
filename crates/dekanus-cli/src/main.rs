@@ -74,6 +74,17 @@ enum Commands {
         #[arg(short, long)]
         token: u32,
     },
+
+    /// Forward multiple tokens independently (no KV cache — Phase 2b-full multi-token deferred)
+    ForwardTokens {
+        /// Model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Comma-separated token IDs (e.g. "151645,872,1531")
+        #[arg(short, long, value_delimiter = ',')]
+        tokens: Vec<u32>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -92,6 +103,7 @@ fn main() -> Result<()> {
         Commands::Info => info(),
         Commands::Inspect { model } => inspect_model(&model),
         Commands::StreamForward { model, token } => stream_forward(&model, token),
+        Commands::ForwardTokens { model, tokens } => forward_tokens(&model, &tokens),
     }
 }
 
@@ -253,6 +265,65 @@ fn stream_forward(model_dir: &std::path::Path, token_id: u32) -> Result<()> {
     println!("---");
     println!("Phase 2b PoC: layer-streaming inference primitive works (load -> use -> release per layer).");
     println!("Phase 2b-full: full Qwen3 attention + MLP + KV cache + decode loop (multi-day).");
+
+    Ok(())
+}
+
+fn forward_tokens(model_dir: &std::path::Path, token_ids: &[u32]) -> Result<()> {
+    use airllm_core::Qwen3StreamingModel;
+    use candle_core::{DType, Device};
+
+    eprintln!(
+        "[dekanus] forward-tokens: model={}, tokens={:?}",
+        model_dir.display(),
+        token_ids
+    );
+
+    let device = Device::Cpu;
+    let dtype = DType::F32;
+
+    let open_start = std::time::Instant::now();
+    let model = Qwen3StreamingModel::open(model_dir, device, dtype)
+        .with_context(|| "opening Qwen3StreamingModel")?;
+    let open_secs = open_start.elapsed().as_secs_f64();
+    eprintln!(
+        "[dekanus] opened in {:.4}s (n_layers={}, hidden={}, vocab={})",
+        open_secs,
+        model.n_layers(),
+        model.hidden_size(),
+        model.vocab_size()
+    );
+
+    let fwd_start = std::time::Instant::now();
+    let all_logits = model
+        .forward_multi_token(token_ids)
+        .with_context(|| "forward_multi_token")?;
+    let fwd_secs = fwd_start.elapsed().as_secs_f64();
+
+    println!("---");
+    println!("tokens: {:?}", token_ids);
+    println!("open_secs: {:.4}", open_secs);
+    println!("forward_secs: {:.4}", fwd_secs);
+    println!("per_token_secs: {:.4}", fwd_secs / token_ids.len() as f64);
+    println!("projected_decode_tps: {:.2}", 1.0 / (fwd_secs / token_ids.len() as f64));
+
+    for (i, logits) in all_logits.iter().enumerate() {
+        let logits_vec: Vec<f32> = logits.squeeze(0)?.to_vec1()?;
+        let (argmax_idx, argmax_val) = logits_vec
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, v)| (i, *v))
+            .unwrap_or((0, 0.0));
+        println!(
+            "token[{}]={} -> argmax={} (logit={:.3})",
+            i, token_ids[i], argmax_idx, argmax_val
+        );
+    }
+    println!("---");
+    println!("Honest PoC: forward_multi_token runs N tokens independently (no KV cache).");
+    println!("Each token sees NO history; output quality not meaningful for generation.");
+    println!("Phase 2b-full multi-token (KV cache + RoPE + QK-norm + decode loop) deferred.");
 
     Ok(())
 }
