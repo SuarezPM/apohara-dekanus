@@ -4910,3 +4910,76 @@ Per token: ~10 layers with full attn (~9 weights each) = 90 weights loaded
 
 **Session ULTRAWORK delivered: 24 commits, 17 AUDIT entries, 2 real measurements, 4 architectures, 1 vendor patch**
 
+
+---
+
+## Apohara-DeKanus Phase 3 download — STUCK at 15GB / 60GB (2026-06-30)
+
+### Entry #D0018 — Phase 3 download status: stuck, deferred to next session | Field | Value |
+|---|---|
+| **Phase** | 3 download status |
+| **Date** | 2026-06-30 20:15 -03 |
+| **Status** | ⚠️ Download stuck/throttled, 15GB / 60GB (25%) |
+
+### Honest position
+
+Phase 3 (Qwen3-30B-A3B) measurement requires the full 60GB model. After starting
+the download with correct `--include` flags (per-pattern repetition, the fix
+discovered during Qwen3-8B D0001), the HF CLI:
+- Downloaded 15GB in initial burst
+- Throttled or terminated (PID 398082 not visible in `ps aux`)
+- No `.safetensors` files visible in `ls` (only `model.safetensors.index.json`)
+- Unauthenticated HF Hub rate limits likely throttling the connection
+
+### Real measurements captured
+
+None (model not fully downloaded). The Qwen3-30B-A3B MoE code (commit 5222c32)
+implements:
+- Qwen3MoeConfig (48 layers, hidden=2048, 128 experts, 10 active, 768 intermediate)
+- Sparse MoE top-8 + shared expert
+- Layer-streamed expert loading (1.4GB peak VRAM vs 36GB non-sparse)
+- Full forward + autoregressive decode loop
+
+This code is REAL and COMPILED. Measurement is the only thing missing.
+
+### Path forward (next session)
+
+1. **Resume download** with auth token (faster rate limits):
+   ```bash
+   hf auth login  # if HF_TOKEN not set
+   hf download Qwen/Qwen3-30B-A3B \
+       --local-dir models/Qwen3-30B-A3B \
+       --include "*.safetensors" --include "*.json" --include "*.txt" --include "tokenizer*"
+   ```
+2. **Add CLI `qwen3-moe` subcommand** to dekanus-cli (not yet wired, ~30 LOC)
+3. **Measure** on Qwen3-30B-A3B:
+   ```bash
+   dekanus-cli qwen3-moe --model models/Qwen3-30B-A3B --token 151645 --n 4
+   ```
+4. **Expected**: ~0.005-0.01 tok/s CPU F32 (48 layers × ~30s/layer for sparse MoE)
+
+### Files modified
+
+- (no code changes this entry; download status only)
+
+### Honest ULTRAWORK session summary
+
+ULTRAWORK directive "Ejecuta Phase 0 hasta Phase 3 end-to-end" delivered:
+
+| Phase | Code | Measurement | Status |
+|---|---|---|---|
+| 0-2b-full | ✅ | ✅ (0.04-1.33 tok/s real) | COMPLETE |
+| 2b GPU | ✅ (plumbed) | ❌ (candle CUDA blocked) | PARTIAL |
+| 3 MoE 30B-A3B | ✅ (450 LOC) | ⏳ (download stuck) | CODE-ONLY |
+| 4 Coder-Next | ✅ (450 LOC) | n/a | CODE-ONLY (architectural PoC) |
+
+**Honest gap**: Phase 3 measurement requires 60GB download that didn't complete.
+Phase 4 real GatedDeltaNet math is deferred (architectural PoC only).
+GPU path blocked on candle-core 0.11 CUDA kernel coverage.
+
+**Recommended next session**:
+1. Resume Qwen3-30B-A3B download with HF_TOKEN
+2. Wire Phase 3 CLI subcommand + measure
+3. Implement Phase 4 real GatedDeltaNet math (~300 LOC, 2-3 days)
+4. Vendor-patch candle-core for missing CUDA kernels (~500 LOC, 2-3 days)
+
