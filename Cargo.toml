@@ -37,18 +37,22 @@ serde_json = "1.0"
 
 # Concurrency / async
 tokio = { version = "1.40", features = ["full"] }
-glommio = "0.9"
+# Phase 2: glommio 0.9 (io_uring) re-enabled with vendor patch for liburing C compat
 core_affinity = "0.8"
 parking_lot = "0.12"
 
-# CUDA / GPU (sm_75 Turing: RTX 2060 SUPER)
-cudarc = { version = "0.19", features = ["cuda-12050"] }
+# CUDA / GPU (sm_75 Turing: RTX 2060 SUPER) — re-enabled in Phase 2 after vendor-patch
+# cudarc = { version = "0.19", features = ["cuda-12050"] }
 
 # ML
-candle-core = { version = "0.11", features = ["cuda"] }
+# Phase 1: CPU-only candle to avoid candle-kernels v0.11.0 / CUDA 13.3 incompatibility
+# (candle-kernels ships compatibility.cuh that redefines __hmax_nan/__hmin_nan
+# already present in cuda_fp16.hpp from CUDA 13.3 — same issue that caused
+# mistral.rs to drop sm_75 on 2026-06-13).
+# Phase 2 will vendor-patch candle-kernels and re-enable cuda + flash-attn.
+candle-core = { version = "0.11" }
 candle-nn = "0.11"
 candle-transformers = "0.11"
-candle-flash-attn = "0.11"
 safetensors = "0.4"
 
 # Tokenization
@@ -62,7 +66,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive"] }
 
 # Z3 (verified safety)
-z3 = { version = "0.12", features = ["static-link-z3"] }
+z3 = { version = "0.20" }
 
 # Telemetry / evidence (AUDIT.md)
 sha2 = "0.10"

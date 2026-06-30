@@ -16,6 +16,5 @@ half = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-cudarc = { workspace = true }
 candle-core = { workspace = true }
 tracing = { workspace = true }

@@ -1,45 +1,40 @@
-//! Pinned host memory buffer for DMA-eligible H2D transfers.
+//! Pinned host memory buffer for DMA-eligible H2D transfers (Phase 1 placeholder).
 //!
-//! Phase 1 uses `cudarc::CudaContext::alloc_pinned()` for DMA-eligible memory.
-//! Avoids the mmap+mlock+cuMemHostRegister anti-pattern (cudarc does it automatically).
+//! Phase 1: CPU-only. This struct is a placeholder for the Phase 2 pinned buffer
+//! that will use `cudarc::CudaContext::alloc_pinned()` for DMA-eligible memory.
+//!
+//! Phase 2 design notes:
+//! - cudarc does pinned allocation automatically (cuMemAllocHost = page-locked for DMA)
+//! - Avoid the mmap + mlock + cuMemHostRegister anti-pattern
+//! - Real impl will use raw pointers + unsafe, requiring `#![allow(unsafe_code)]`
+//!   or moving this module to a separate crate with appropriate safety contract
 
+/// CPU-only placeholder. Phase 2 will wrap cudarc::CudaContext::alloc_pinned result.
 pub struct PinnedHostBuffer {
-    ptr: *mut u8,
-    len: usize,
+    bytes: Vec<u8>,
 }
 
-unsafe impl Send for PinnedHostBuffer {}
-unsafe impl Sync for PinnedHostBuffer {}
-
 impl PinnedHostBuffer {
-    /// Allocate a pinned host buffer of `size` bytes.
-    /// Phase 1: cudarc::CudaContext::alloc_pinned wrapper.
+    /// Allocate a buffer of `size` bytes (CPU heap in Phase 1).
     pub fn alloc(size: usize) -> Self {
-        // Skeleton: in Phase 1, this calls cudarc::CudaContext::alloc_pinned(size)
-        // and stores the resulting device pointer.
         Self {
-            ptr: std::ptr::null_mut(),
-            len: size,
+            bytes: vec![0u8; size],
         }
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.bytes.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.bytes.is_empty()
     }
-}
 
-impl Drop for PinnedHostBuffer {
-    fn drop(&mut self) {
-        // Phase 1: call cudarc free
-        if !self.ptr.is_null() {
-            // SAFETY: ptr was allocated by cudarc alloc_pinned, only freed here
-            unsafe {
-                // cudarc::CudaContext::free_pinned(self.ptr)
-            }
-        }
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.bytes
     }
 }

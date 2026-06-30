@@ -17,7 +17,7 @@ pub trait SelectivePolicy: Send + Sync {
 
     /// Produce up to `k` speculative draft tokens given the context.
     /// Returns empty Vec if speculation disabled.
-    fn speculate(&self, _ctx_tokens: &[u32], k: usize) -> Vec<u32> {
+    fn speculate(&self, _ctx_tokens: &[u32], _k: usize) -> Vec<u32> {
         Vec::with_capacity(0) // default: no speculation
     }
 
