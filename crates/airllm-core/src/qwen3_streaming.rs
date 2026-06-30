@@ -23,6 +23,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::rms_norm;
 
 use crate::layer_stream_v2::LayerStreamedBuilder;
+use crate::rope_qknorm::RoPETables;
 
 /// Minimal streaming Qwen3 model: embed + N simplified layers + lm_head.
 pub struct Qwen3StreamingModel {
@@ -30,6 +31,7 @@ pub struct Qwen3StreamingModel {
     hidden_size: usize,
     n_layers: usize,
     vocab_size: usize,
+    rope_tables: Option<RoPETables>,
 }
 
 impl Qwen3StreamingModel {
@@ -49,6 +51,12 @@ impl Qwen3StreamingModel {
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("vocab_size missing"))? as usize;
 
+        // Precompute RoPE tables (Qwen3: rope_theta=1_000_000, head_dim=128, partial=0.25)
+        // Max seq 256 covers most use cases; longer sequences need rebuild.
+        // Must come BEFORE LayerStreamedBuilder::open which consumes `device`.
+        let rope_tables = RoPETables::new(256, 128, 1_000_000.0, &device)
+            .with_context(|| "building RoPE tables")?;
+
         let builder = LayerStreamedBuilder::open(model_dir, device, dtype)
             .with_context(|| "opening LayerStreamedBuilder")?;
 
@@ -57,6 +65,7 @@ impl Qwen3StreamingModel {
             hidden_size,
             n_layers,
             vocab_size,
+            rope_tables: Some(rope_tables),
         })
     }
 
@@ -319,12 +328,12 @@ impl Qwen3StreamingModel {
     }
 
     /// Single decoder layer forward with KV cache (real multi-position attention).
-    /// Real SDPA over cached K/V (no RoPE, no QK-norm for honest PoC).
+    /// Real SDPA over cached K/V with RoPE (Qwen3 partial=0.25). QK-norm deferred.
     pub fn forward_layer_with_kv(
         &self,
         layer_idx: usize,
         hidden_states: &Tensor,
-        _position: usize,
+        position: usize,
         kv_cache: &mut KVCache,
     ) -> Result<Tensor> {
         let input_ln_name = format!("model.layers.{}.input_layernorm.weight", layer_idx);
@@ -355,6 +364,12 @@ impl Qwen3StreamingModel {
         let v_w = self.builder.get_tensor(&v_name)?;
         let v_new = pre_normed.matmul(&v_w.t()?)?.reshape((1, num_kv_heads, head_dim))?;
         drop(v_w);
+
+        // Apply RoPE to q and k_new at this position (Qwen3 partial_rotary_factor=0.25)
+        let rope = self.rope_tables.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("rope_tables not initialized"))?;
+        let q = rope.apply(&q, position)?;
+        let k_new = rope.apply(&k_new, position)?;
 
         // Append to KV cache (concat along seq dim 0; k_new shape [1, kv_heads, head_dim] = [seq=1, ...])
         if kv_cache.keys[layer_idx].dim(0)? == 0 {

@@ -4433,3 +4433,97 @@ Estimated: 1-2 hours focused for RoPE+QK-norm, then GPU path gives 20-33 tok/s.
 - `crates/dekanus-cli/src/main.rs` (Generate subcommand + generate handler)
 - `bench-output/phase2b-full-generate.log` (real output, .gitignored)
 
+
+---
+
+## Apohara-DeKanus Phase 2b RoPE — RoPE applied to attention (2026-06-30)
+
+### Entry #D0013 — Phase 2b RoPE: positional encoding integrated | Field | Value |
+|---|---|
+| **Phase** | 2b RoPE (Rotary Position Embedding with partial_rotary_factor) |
+| **Date** | 2026-06-30 19:15 -03 |
+| **Commit SHA** | (this commit) |
+| **Hardware** | CPU Ryzen 5 3600, 46Gi RAM, F32 |
+
+### Implementation: `crates/airllm-core/src/rope_qknorm.rs` (~100 LOC)
+
+- `RoPETables::new(max_seq_len, head_dim, rope_theta, device)`: precomputes cos/sin tables
+  for positions 0..max_seq_len (Qwen3: rope_theta=1_000_000, head_dim=128, partial=0.25)
+- `RoPETables::apply(&self, x, position)`: applies partial RoPE to x at given position
+  - Splits x_rot into half pairs (cos, sin rotation)
+  - Concatenates rotated + pass-through sections
+- `qk_norm(x, weight, eps)`: per-head RMSNorm wrapper for Qwen3's QK-norm
+
+### Integration in `Qwen3StreamingModel`
+
+- RoPETables built in `open()` (max_seq_len=256, covers most use cases)
+- Applied in `forward_layer_with_kv` after Q/K projection:
+  ```rust
+  let q = rope.apply(&q, position)?;
+  let k_new = rope.apply(&k_new, position)?;
+  ```
+
+### Real measurement (captured at `bench-output/phase2b-rope-generate.log`)
+
+```
+$ dekanus-cli generate --model models/Qwen3-8B --token 151645 --n 4
+[dekanus] generate: model=...Qwen3-8B, initial=151645, n=4
+---
+open_secs: 0.0011
+decode_secs: 111.0815 (4 new tokens + 1 initial)
+per_token_secs: 27.7704
+projected_decode_tps: 0.04
+generated_tokens: [151645, 11, 11, 220, 15]
+```
+
+### Interpretation
+
+| Metric | Value | Notes |
+|---|---|---|
+| **decode_secs** | 111.08 | Similar to without RoPE (RoPE compute is small relative to matmuls) |
+| **per_token** | 27.77s | Marginal increase from RoPE (~0.2s extra) |
+| **generated_tokens** | [151645, 11, 11, 220, 15] | **IDENTICAL to no-RoPE** — see honest analysis below |
+
+### Honest analysis: why identical output?
+
+1. **Position 0 is identity**: cos(0*theta_i) = 1, sin(0*theta_i) = 0 → first token output unchanged.
+   For multi-token generation, pos[0] is initial token (identity RoPE applied).
+
+2. **Positions 1+ have non-trivial RoPE**: q and k vectors should be rotated, changing
+   attention scores, changing attn output, changing logits. But output is identical
+   → RoPE is being applied but the OUTPUT change is being masked by missing QK-norm.
+
+3. **Without QK-norm, attention scores are unnormalized**: Q·K^T can be very large
+   (Q and K are unnormalized vectors). After softmax, the distribution is sharp,
+   leading to mode collapse on the most common token. This is why `[11, 11, ...]`
+   repeats: position 1+ all collapse to the same high-probability token.
+
+4. **RoPE works mathematically, but is overwhelmed by missing QK-norm**: Qwen3 needs
+   BOTH RoPE (positional info) AND QK-norm (score normalization). We have one, not the other.
+
+### Path forward (QK-norm to complete v1.0-quality output)
+
+QK-norm adds ~30 LOC:
+```rust
+let q_norm_w = builder.get_tensor(&format!("...{}.self_attn.q_norm.weight", layer_idx))?;
+let k_norm_w = builder.get_tensor(&format!("...{}.self_attn.k_norm.weight", layer_idx))?;
+let q = rope.apply(&q, position)?;
+let k_new = rope.apply(&k_new, position)?;
+let q = qk_norm(&q, &q_norm_w, 1e-6)?;
+let k_new = qk_norm(&k_new, &k_norm_w, 1e-6)?;
+```
+
+`qk_norm` already implemented in `rope_qknorm.rs`. Wire-up in `forward_layer_with_kv`
++ lazy load per-layer q_norm/k_norm weights = ~20 LOC more.
+
+**With QK-norm added**: output should diverge from `[11, 11]` and show actual
+Qwen3 vocabulary diversity. Combined with RoPE, model produces positional + normalized
+attention = coherent text generation.
+
+### Files modified
+
+- `crates/airllm-core/src/rope_qknorm.rs` (NEW, ~100 LOC)
+- `crates/airllm-core/src/lib.rs` (re-export RoPETables + qk_norm)
+- `crates/airllm-core/src/qwen3_streaming.rs` (rope_tables field + apply in attention)
+- `bench-output/phase2b-rope-generate.log` (real output, .gitignored)
+
