@@ -1,41 +1,29 @@
 //! Centralized dispatch shim for ops that lack CUDA kernels in candle-core 0.11.
 //!
-//! Phase 2b GPU unblock plan (Wave 5):
-//! - T7: replace .narrow(...) + .squeeze(...) and Tensor::stack(...) in rope_qknorm::apply
-//! - T8: replace .narrow(...) + .squeeze(...) in forward_layer_with_kv lines 404-406
+//! Phase 2b GPU unblock plan (Wave 5+): when custom CUDA kernels exist in
+//! `airllm-kernels`, this shim will route to them on CUDA device.
+//! Until then (T6.5 fix pending), this is a CPU-only passthrough that
+//! preserves original candle API behavior exactly.
 //!
-//! Behavior:
-//! - CPU device: passthrough to candle's Tensor::narrow / Tensor::stack (fast, no overhead)
-//! - CUDA device: error with actionable message (custom kernel plumbing deferred to
-//!   T6.5 fix — see AUDIT D0019 for blocker analysis)
-//!
-//! This is a SAFE non-breaking change: CPU F32 path (0.04 tok/s baseline) preserved
-//! exactly, GPU path now gives clean error instead of CUDA_ERROR_NOT_FOUND.
+//! API matches candle's Tensor::narrow / Tensor::stack exactly (D enum parameter),
+//! so call sites can be wired by adding `crate::dispatch::` prefix without
+//! any other change. This is the key difference from the previous attempt
+//! (which translated to integer and introduced a semantic bug).
 
 use anyhow::{anyhow, Result};
 use candle_core::{D, Tensor};
 
 /// Narrow a tensor along `dim` over [start, start+length).
-/// CPU: passthrough to Tensor::narrow.
-/// CUDA: error (kernel not yet integrated).
-/// `dim` is an axis index: positive = 0-based axis, negative = from-end axis
-/// (e.g. -1 = last axis, -2 = second-to-last, matching candle's D enum convention).
-/// Only supports rank 1-2 tensors (candle's D enum has only Minus1 and Minus2).
-pub fn narrow(t: &Tensor, dim: i64, start: usize, length: usize) -> Result<Tensor> {
+/// CPU: passthrough to Tensor::narrow (1:1 byte-identical, no transformation).
+/// CUDA: error with actionable message (custom kernel pending T6.5).
+pub fn narrow(t: &Tensor, dim: D, start: usize, length: usize) -> Result<Tensor> {
     if t.device().is_cuda() {
         Err(anyhow!(
             "narrow CUDA dispatch not yet wired (T6.5 fix pending). \
              CPU passthrough works; for GPU, see AUDIT D0019."
         ))
     } else {
-        let rank = t.dims().len() as i64;
-        let normalized = if dim < 0 { (dim + rank) as usize } else { dim as usize };
-        let d = match normalized {
-            1 => D::Minus1,
-            2 => D::Minus2,
-            _ => return Err(anyhow!("narrow: dim index {} not supported (rank={})", dim, rank)),
-        };
-        Ok(t.narrow(d, start, length)?)
+        Ok(t.narrow(dim, start, length)?)
     }
 }
 

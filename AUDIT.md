@@ -5265,3 +5265,60 @@ Qwen3-30B-A3B on RTX 2060 SUPER 8GB VRAM (future GPU measurement):
 - `bench-output/phase3-qwen30b-a3b.log` (real output, .gitignored)
 - `AUDIT.md` (this entry)
 
+
+---
+
+## Apohara-DeKanus T7 wire-up SUCCESS (D0018) — 2026-06-30
+
+### Entry #D0018 — T7 (rope_qknorm → dispatch): PASS, T8 partial | Field | Value |
+|---|---|---|
+| **Phase** | ULTRAWORK Wave 5 (T7+T8 dispatch wire-up) |
+| **Date** | 2026-06-30 22:30 -03 |
+| **Commit SHA** | (this commit) |
+
+### Implementation
+
+Rewrote `crates/airllm-core/src/dispatch.rs` to use `D` enum directly (not integer).
+This eliminates the D::Minus1 vs integer axis semantic bug from previous attempts.
+CPU passthrough is now 1:1 byte-identical to direct candle calls.
+
+Wired 4 of 5 narrow+stack sites in `rope_qknorm.rs`:
+- `x.narrow(D::Minus1, 0, self.rotary_dim)?` → `crate::dispatch::narrow(x, D::Minus1, 0, self.rotary_dim)?`
+- `x.narrow(D::Minus1, self.rotary_dim, pass_dim)?` → same with dispatch shim
+- `x_pairs.narrow(D::Minus1, 0/1, 1)?` → dispatch shim
+- `Tensor::stack(&[&new_real, &new_imag], D::Minus1)?` → `crate::dispatch::stack(...)`
+
+T8 (qwen3_streaming.rs lines 404-406) NOT wired (4th edit failed whitespace match).
+The original `q.narrow(1, h, 1)?` call still works because candle has an implicit
+conversion from `usize` to `D` enum (via `impl From<usize> for D` or similar).
+The wire-up of T8 is deferred to next session.
+
+### Real CPU regression test (m0549)
+
+```
+$ dekanus-cli generate --model models/Qwen3-8B --token 151645 --n 8
+[dekanus] generate: model=...Qwen3-8B, initial=151645, n=8, gpu=false
+---
+open_secs: 0.0014
+decode_secs: 220.2699 (8 new tokens + 1 initial)
+per_token_secs: 27.5337
+projected_decode_tps: 0.04
+generated_tokens: [151645, 11, 220, 17, 271, 32313, 11, 773, 358]
+```
+
+**Byte-identical to D0014 baseline** (the dispatch shim passthrough is 1:1 with direct candle calls).
+
+### Files modified
+
+- `crates/airllm-core/src/dispatch.rs` (rewritten: D enum API matching candle exactly)
+- `crates/airllm-core/src/rope_qknorm.rs` (4 narrow+stack sites wired to dispatch)
+- `bench-output/T7-T8-wireup-test.log` (real output, .gitignored)
+- `AUDIT.md` (this entry)
+
+### Status
+
+- ✅ T7 (rope_qknorm → dispatch) PASS — byte-identical to D0014 baseline
+- ⚠️ T8 (qwen3_streaming → dispatch) PARTIAL — qwen3_streaming still uses direct candle::narrow (works correctly, but not routed through dispatch shim). Deferred to next session.
+- ⏳ T11 GPU smoke — pending (still blocked on D0015 reshape error)
+- ⏳ T6.5 cudarc Storage API fix — pending (1-2h focused coding)
+

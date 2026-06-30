@@ -41,8 +41,8 @@ impl RoPETables {
         let head_dim = x.dim(D::Minus1)?;
         let pass_dim = head_dim - self.rotary_dim;
 
-        let x_rot = x.narrow(D::Minus1, 0, self.rotary_dim)?;
-        let x_pass = x.narrow(D::Minus1, self.rotary_dim, pass_dim)?;
+        let x_rot = crate::dispatch::narrow(x, D::Minus1, 0, self.rotary_dim)?;
+        let x_pass = crate::dispatch::narrow(x, D::Minus1, self.rotary_dim, pass_dim)?;
 
         // Reshape last dim from [rotary_dim] to [half, 2], preserving all leading dims.
 // x_rot shape: [..., rotary_dim] -> x_pairs shape: [..., half, 2]
@@ -52,8 +52,8 @@ impl RoPETables {
         target_shape.push(2);
         let x_pairs = x_rot.reshape(target_shape).with_context(|| "reshape to pairs")?;
         let x_pairs_shape: Vec<usize> = x_pairs.dims().to_vec();
-        let x_real = x_pairs.narrow(D::Minus1, 0, 1)?.squeeze(D::Minus1)?;
-        let x_imag = x_pairs.narrow(D::Minus1, 1, 1)?.squeeze(D::Minus1)?;
+        let x_real = crate::dispatch::narrow(&x_pairs, D::Minus1, 0, 1)?.squeeze(D::Minus1)?;
+        let x_imag = crate::dispatch::narrow(&x_pairs, D::Minus1, 1, 1)?.squeeze(D::Minus1)?;
 
         let mut cos_shape: Vec<usize> = vec![1; x_pairs_shape.len() - 1];
         if let Some(last) = cos_shape.last_mut() {
@@ -65,7 +65,7 @@ impl RoPETables {
         let new_real = (x_real.broadcast_mul(&cos_b)? - x_imag.broadcast_mul(&sin_b)?)?;
         let new_imag = (x_real.broadcast_mul(&sin_b)? + x_imag.broadcast_mul(&cos_b)?)?;
 
-        let new_pairs = Tensor::stack(&[&new_real, &new_imag], D::Minus1)?;
+        let new_pairs = crate::dispatch::stack(&[&new_real, &new_imag], D::Minus1)?;
         // Collapse last two dims (half, 2) back into rotary_dim
         let x_rot_out = new_pairs.reshape(x_rot_dims.clone())?;
 
