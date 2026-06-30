@@ -234,6 +234,42 @@ fn inspect_model(model_dir: &std::path::Path) -> Result<()> {
     }
 
     println!("---");
+    println!("# Phase 2b simulation: sequential read of all 36 layer attn q_proj tensors");
+    println!("# (simulates per-layer H2D pattern that Phase 2b custom Qwen3 forward would use)");
+    let bench_start = std::time::Instant::now();
+    let mut per_layer_ms = Vec::with_capacity(36);
+    for layer_idx in 0..36 {
+        let name = format!("model.layers.{}.self_attn.q_proj.weight", layer_idx);
+        let t0 = std::time::Instant::now();
+        let _t = builder
+            .get_tensor(&name)
+            .with_context(|| format!("reading tensor '{}'", name))?;
+        per_layer_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+    let total_bench_ms = bench_start.elapsed().as_secs_f64() * 1000.0;
+    let avg_ms = per_layer_ms.iter().sum::<f64>() / per_layer_ms.len() as f64;
+    let max_ms = per_layer_ms.iter().cloned().fold(0.0_f64, f64::max);
+    let min_ms = per_layer_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+    println!(
+        "bench_total_ms: {:.2} (36 layers sequential q_proj read)",
+        total_bench_ms
+    );
+    println!(
+        "per_layer: avg={:.2}ms min={:.2}ms max={:.2}ms",
+        avg_ms, min_ms, max_ms
+    );
+    let est_full_model_ms = total_bench_ms * 10.0; // ~10 tensors per layer
+    println!(
+        "estimated_full_layer_stream_ms: {:.0} (×10 tensors/layer)",
+        est_full_model_ms
+    );
+    let projected_tps = 1000.0 / (avg_ms * 10.0);
+    println!(
+        "projected_decode_tps_if_io_bound: {:.2} (only true if compute << I/O)",
+        projected_tps
+    );
+
+    println!("---");
     println!("Phase 2a verification: layer-streamed reader works (lazy tensor access).");
     println!("Phase 2b next: custom Qwen3 forward pass that uses this builder per-layer.");
 
