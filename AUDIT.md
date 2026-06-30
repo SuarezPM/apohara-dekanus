@@ -3576,3 +3576,77 @@ Workspace crates: airllm-core, dekanus-cli, dekanus-selective,
 - ✅ Binary runs and outputs expected info
 - ⚠️ GPU path deferred to Phase 2 (candle-kernels patch needed)
 
+
+---
+
+## Apohara-DeKanus Phase 1b — Qwen3 forward pass wired (2026-06-30)
+
+### Entry #D0003 — Phase 1b: Qwen3 inference path | Field | Value |
+|---|---|
+| **Phase** | 1b (Qwen3 forward pass runner) |
+| **Date** | 2026-06-30 16:25 -03 |
+| **Commit SHA** | `ee72eb8` |
+| **Status** | ✅ cargo check + build pass; binary runs |
+| **Pending** | Qwen3-8B download (bg_b60c334a, ~6 min in progress) |
+
+### Qwen3 arch verification (engram 1014)
+
+| Model | arch_type | layers | hidden | experts | candle support |
+|---|---|---|---|---|---|
+| **Qwen3-8B** | Qwen3ForCausalLM (dense) | 36 | 4096 | 1 (dense) | ✅ qwen3.rs |
+| **Qwen3-30B-A3B** | Qwen3MoEForCausalLM | ~48 | 3072 | 128 (8 routed + 1 shared) | ✅ qwen3_moe.rs |
+| **Qwen3-Coder-Next** | Qwen3NextForCausalLM | 48 | 2048 | 512 (10 routed + 1 shared) | ❌ NOT in candle |
+
+### Coder-Next gap analysis
+- Hybrid arch: GatedDeltaNet (linear attention) + GatedAttention, 3:1 ratio
+- 48 layers, GQA 16:2, MoE 512 experts × 10 routed
+- max_position_embeddings: 262144 (256K context)
+- vocab_size: 151936
+- NOT in candle-transformers 0.11.0 (verified by `ls candle-transformers/src/models/`)
+- Custom impl needed: `dekanus-qwen3-next` crate (~500 LOC for GatedDeltaNet
+  + MoE routing + shared expert + sparse activation salt)
+
+### Phase 1b deliverables
+
+- `airllm-core/src/qwen3_runner.rs` (276 LOC):
+  - `Qwen3Runner::cpu()` factory
+  - `load_dense()` — Qwen3 dense via candle-transformers
+  - `load_moe()` — Qwen3 MoE via candle-transformers
+  - `tokenize_prompt()` + `decode()`
+  - `sample_next()` — greedy argmax with optional temperature scaling
+  - `generate_dense()` — prefill + decode loop with EOS termination
+- `dekanus-cli/src/main.rs` (rewritten, ~150 LOC):
+  - `run` command with auto-detect variant from config.json model_type
+  - Wired to Qwen3Runner::load_dense + generate_dense
+  - Reports tok/s, elapsed, prompt_tokens, generated_tokens
+
+### Build verification (real)
+
+```
+$ cargo check --workspace
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.34s
+
+$ cargo build -p dekanus-cli
+    Finished `dev` profile [optimized + debuginfo] target(s) in 2.68s
+
+$ cargo run -p dekanus-cli --quiet -- info
+apohara-dekanus 0.1.0
+Workspace crates: airllm-core, dekanus-cli, dekanus-selective,
+                   dekanus-quant-kv, dekanus-llmlingua2, dekanus-rag,
+                   dekanus-romy, audit-honesty
+Phase: 1b (Qwen3 dense forward pass via candle-transformers)
+```
+
+### Honest position
+- ❌ No tok/s measurement yet (Qwen3-8B download in progress)
+- ✅ Qwen3 forward pass code written + compiles + binary runs
+- ⚠️ Phase 1b target (≥35 tok/s in-VRAM) requires actual model + measurement
+- ⚠️ Phase 3 (Qwen3-Coder-Next) blocked on custom Qwen3NextForCausalLM impl
+  (~500 LOC, multi-week effort, deferred to Phase 3a)
+
+### Phase 1c prerequisites (after download completes)
+- Run `cargo run -p dekanus-cli -- run --model models/Qwen3-8B --prompt 'Hello'`
+- Measure tok/s on CPU first (expect <2 tok/s due to no GPU)
+- Verify generated text is coherent
+- AUDIT entry D0004 with measured numbers
+
