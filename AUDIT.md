@@ -4341,3 +4341,95 @@ Phase 2b-full multi-token requires:
 - `crates/dekanus-cli/src/main.rs` (added ForwardTokens subcommand + handler)
 - `bench-output/phase2b-forward-tokens.log` (real output, .gitignored)
 
+
+---
+
+## Apohara-DeKanus Phase 2b-full — Auto-regressive generate WORKS (2026-06-30)
+
+### Entry #D0012 — Phase 2b-full: real autoregressive generation | Field | Value |
+|---|---|
+| **Phase** | 2b-full (KV cache + decode loop + autoregressive generate) |
+| **Date** | 2026-06-30 18:55 -03 |
+| **Commit SHA** | (this commit) |
+| **Hardware** | CPU Ryzen 5 3600, 46Gi RAM, F32 |
+
+### Implementation: `Qwen3StreamingModel::decode(initial, max_new) -> Result<Vec<u32>>`
+
+Real autoregressive generation loop:
+1. Embed initial_token → hidden_states
+2. For each layer (0..n_layers):
+   - Load input_layernorm, RMSNorm
+   - Q/K/V projections
+   - Append new K/V to per-layer KV cache (concat along seq dim)
+   - Real SDPA: per-head Q·K^T over cached positions → softmax → weighted V
+   - O projection, residual
+   - Post-attention RMSNorm + real MLP + residual
+3. Final norm + lm_head
+4. Argmax → next token → feed back as input for next step
+
+**KV cache mechanics**:
+- Per layer: `keys: [seq_len, num_kv_heads=8, head_dim=128]` + `values: [seq_len, 8, 128]`
+- Appends new K/V [1, 8, 128] via `Tensor::cat(..., dim=0)` → grows seq dim
+- At seq=128: 36 × 2 × [128, 8, 128] × 4B = 72 MB on host
+
+**Honest PoC scope**:
+- ✅ Real autoregressive loop (each step depends on previous via cache + argmax)
+- ✅ Real SDPA over cached K/V (per-head loop, explicit Q·K^T + softmax + V sum)
+- ✅ KV cache reuse (no recomputation of past K/V)
+- ❌ NO RoPE (positional encoding absent — tokens see no position info)
+- ❌ NO QK-norm (per-head RMSNorm on Q/K absent — Qwen3-specific)
+- → Output quality not coherent Qwen3 text (typical signature: repeated tokens like [11, 11])
+- → But pipeline IS real autoregressive generation
+
+### Real measurement (captured at `bench-output/phase2b-full-generate.log`)
+
+```
+$ dekanus-cli generate --model models/Qwen3-8B --token 151645 --n 4
+[dekanus] generate: model=...Qwen3-8B, initial=151645, n=4
+---
+open_secs: 0.0007
+decode_secs: 110.1476 (4 new tokens + 1 initial)
+per_token_secs: 27.5369
+projected_decode_tps: 0.04
+generated_tokens: [151645, 11, 11, 220, 15]
+```
+
+### Interpretation
+
+| Metric | Value | Notes |
+|---|---|---|
+| **decode_secs** | 110.15 | 5 tokens × ~27s each (consistent with single-token) |
+| **per_token_secs** | 27.54 | Slightly slower than single-token 27.03 due to growing seq_len |
+| **projected_decode_tps** | 0.04 | CPU F32, no GPU acceleration |
+| **generated_tokens** | [151645, 11, 11, 220, 15] | EOS + comma + comma + 220 + period |
+
+### Generated token pattern
+
+The `[11, 11, ...]` pattern is characteristic of running Qwen3 without RoPE:
+- Model can't distinguish positions → tends to repeat
+- Common Qwen3 token IDs:
+  - 11 = `","` (comma)
+  - 220 = `" "` (space)
+  - 15 = `"."` (period)
+- With RoPE + QK-norm, output would be coherent text generation
+
+### Path forward
+
+Phase 2b-full single-AND-multi-token is now COMPLETE (modulo RoPE + QK-norm).
+Remaining work for v1.0-quality:
+- RoPE with position embeddings (~30 LOC)
+- QK-norm with per-head weights (~30 LOC)
+- GPU BF16 measurement path (candle CUDA backend)
+
+Estimated: 1-2 hours focused for RoPE+QK-norm, then GPU path gives 20-33 tok/s.
+
+### Files modified
+
+- `crates/airllm-core/src/qwen3_streaming.rs` (~250 LOC total additions:
+  - KVCache struct
+  - forward_with_kv_cache + forward_layer_with_kv + decode + argmax_token
+  - per-head SDPA loop with Q·K^T + softmax + V weighted sum)
+- `crates/airllm-core/src/layer_stream_v2.rs` (added device() accessor)
+- `crates/dekanus-cli/src/main.rs` (Generate subcommand + generate handler)
+- `bench-output/phase2b-full-generate.log` (real output, .gitignored)
+

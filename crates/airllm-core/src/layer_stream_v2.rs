@@ -197,6 +197,11 @@ impl LayerStreamedBuilder {
         self.shards.len()
     }
 
+    /// Device accessor (used by KVCache::new and downstream).
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// Total tensor count across all shards.
     pub fn tensor_count(&self) -> usize {
         self.shards

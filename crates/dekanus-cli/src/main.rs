@@ -85,6 +85,21 @@ enum Commands {
         #[arg(short, long, value_delimiter = ',')]
         tokens: Vec<u32>,
     },
+
+    /// Auto-regressive generate from initial token with KV cache (Phase 2b-full multi-token)
+    Generate {
+        /// Model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Initial token ID
+        #[arg(short, long)]
+        token: u32,
+
+        /// Number of new tokens to generate
+        #[arg(short = 'n', long, default_value_t = 8)]
+        n: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -104,6 +119,7 @@ fn main() -> Result<()> {
         Commands::Inspect { model } => inspect_model(&model),
         Commands::StreamForward { model, token } => stream_forward(&model, token),
         Commands::ForwardTokens { model, tokens } => forward_tokens(&model, &tokens),
+        Commands::Generate { model, token, n } => generate(&model, token, n),
     }
 }
 
@@ -324,6 +340,55 @@ fn forward_tokens(model_dir: &std::path::Path, token_ids: &[u32]) -> Result<()> 
     println!("Honest PoC: forward_multi_token runs N tokens independently (no KV cache).");
     println!("Each token sees NO history; output quality not meaningful for generation.");
     println!("Phase 2b-full multi-token (KV cache + RoPE + QK-norm + decode loop) deferred.");
+
+    Ok(())
+}
+
+fn generate(model_dir: &std::path::Path, initial_token: u32, max_new: usize) -> Result<()> {
+    use airllm_core::Qwen3StreamingModel;
+    use candle_core::{DType, Device};
+
+    eprintln!(
+        "[dekanus] generate: model={}, initial={}, n={}",
+        model_dir.display(),
+        initial_token,
+        max_new
+    );
+
+    let device = Device::Cpu;
+    let dtype = DType::F32;
+
+    let open_start = std::time::Instant::now();
+    let model = Qwen3StreamingModel::open(model_dir, device, dtype)
+        .with_context(|| "opening Qwen3StreamingModel")?;
+    let open_secs = open_start.elapsed().as_secs_f64();
+
+    let decode_start = std::time::Instant::now();
+    let generated = model
+        .decode(initial_token, max_new)
+        .with_context(|| "decode")?;
+    let decode_secs = decode_start.elapsed().as_secs_f64();
+
+    println!("---");
+    println!("open_secs: {:.4}", open_secs);
+    println!(
+        "decode_secs: {:.4} ({} new tokens + 1 initial)",
+        decode_secs,
+        max_new
+    );
+    println!(
+        "per_token_secs: {:.4}",
+        decode_secs / max_new as f64
+    );
+    println!(
+        "projected_decode_tps: {:.2}",
+        1.0 / (decode_secs / max_new as f64)
+    );
+    println!("generated_tokens: {:?}", generated);
+    println!("---");
+    println!("Phase 2b-full multi-token: KV cache + decode loop working (no RoPE/QK-norm).");
+    println!("Output quality: not coherent Qwen3 text (positional info + QK-norm absent).");
+    println!("Pipeline: real autoregressive generation loop with KV cache reuse.");
 
     Ok(())
 }

@@ -151,7 +151,7 @@ pub fn attention_block(&self, layer_idx: usize, pre_normed: &Tensor) -> Result<T
         .builder
         .get_tensor(&k_name)
         .with_context(|| format!("loading {}", k_name))?;
-    let k = pre_normed.matmul(&k_w.t()?)?.reshape((1, num_kv_heads, head_dim))?;
+    let _k = pre_normed.matmul(&k_w.t()?)?.reshape((1, num_kv_heads, head_dim))?;
     drop(k_w);
 
     let v_w = self
@@ -269,5 +269,172 @@ pub fn forward_layer(&self, layer_idx: usize, hidden_states: &Tensor) -> Result<
             all_logits.push(logits);
         }
         Ok(all_logits)
+    }
+}
+
+/// Per-layer KV cache: stores K and V tensors for all positions processed so far.
+/// Sequence length grows by 1 per token. Total size at seq_len=128:
+/// 36 layers × 2 (K+V) × [128, 8, 128] BF16 ≈ 72 MB on host (fits in RAM).
+pub struct KVCache {
+    /// Per-layer: (K, V) tensors of shape [seq_len, num_kv_heads, head_dim]
+    pub keys: Vec<Tensor>,
+    pub values: Vec<Tensor>,
+}
+
+impl KVCache {
+    /// Allocate empty cache for n_layers.
+    pub fn new(n_layers: usize, device: &Device) -> Self {
+        Self {
+            keys: (0..n_layers).map(|_| Tensor::zeros((0, 8, 128), DType::F32, device).unwrap()).collect(),
+            values: (0..n_layers).map(|_| Tensor::zeros((0, 8, 128), DType::F32, device).unwrap()).collect(),
+        }
+    }
+}
+
+impl Qwen3StreamingModel {
+    /// Forward a single token at a given position with KV cache (multi-token aware).
+    /// Appends new K/V to the cache; returns logits + updated cache position.
+    /// RoPE + QK-norm still deferred (positional info + per-head RMSNorm).
+    /// For Phase 2b-full multi-token honest PoC.
+    pub fn forward_with_kv_cache(
+        &self,
+        token_id: u32,
+        position: usize,
+        kv_cache: &mut KVCache,
+    ) -> Result<Tensor> {
+        let mut hidden = self.embed(token_id)?;
+
+        for layer_idx in 0..self.n_layers {
+            hidden = self.forward_layer_with_kv(layer_idx, &hidden, position, kv_cache)?;
+        }
+
+        let final_norm = self
+            .builder
+            .get_tensor("model.norm.weight")
+            .with_context(|| "loading model.norm.weight")?;
+        let normed = rms_norm(&hidden, &final_norm, 1e-6)?;
+        drop(final_norm);
+
+        self.lm_head(&normed)
+    }
+
+    /// Single decoder layer forward with KV cache (real multi-position attention).
+    /// Real SDPA over cached K/V (no RoPE, no QK-norm for honest PoC).
+    pub fn forward_layer_with_kv(
+        &self,
+        layer_idx: usize,
+        hidden_states: &Tensor,
+        _position: usize,
+        kv_cache: &mut KVCache,
+    ) -> Result<Tensor> {
+        let input_ln_name = format!("model.layers.{}.input_layernorm.weight", layer_idx);
+        let post_ln_name = format!("model.layers.{}.post_attention_layernorm.weight", layer_idx);
+        let q_name = format!("model.layers.{}.self_attn.q_proj.weight", layer_idx);
+        let k_name = format!("model.layers.{}.self_attn.k_proj.weight", layer_idx);
+        let v_name = format!("model.layers.{}.self_attn.v_proj.weight", layer_idx);
+        let o_name = format!("model.layers.{}.self_attn.o_proj.weight", layer_idx);
+
+        let num_heads = 32usize;
+        let num_kv_heads = 8usize;
+        let head_dim = 128usize;
+
+        // Pre-attention RMSNorm
+        let ln_w = self.builder.get_tensor(&input_ln_name)?;
+        let pre_normed = rms_norm(hidden_states, &ln_w, 1e-6)?;
+        drop(ln_w);
+
+        // Q/K/V projections
+        let q_w = self.builder.get_tensor(&q_name)?;
+        let q = pre_normed.matmul(&q_w.t()?)?.reshape((1, num_heads, head_dim))?;
+        drop(q_w);
+
+        let k_w = self.builder.get_tensor(&k_name)?;
+        let k_new = pre_normed.matmul(&k_w.t()?)?.reshape((1, num_kv_heads, head_dim))?;
+        drop(k_w);
+
+        let v_w = self.builder.get_tensor(&v_name)?;
+        let v_new = pre_normed.matmul(&v_w.t()?)?.reshape((1, num_kv_heads, head_dim))?;
+        drop(v_w);
+
+        // Append to KV cache (concat along seq dim 0; k_new shape [1, kv_heads, head_dim] = [seq=1, ...])
+        if kv_cache.keys[layer_idx].dim(0)? == 0 {
+            kv_cache.keys[layer_idx] = k_new.clone();
+            kv_cache.values[layer_idx] = v_new.clone();
+        } else {
+            kv_cache.keys[layer_idx] = Tensor::cat(&[&kv_cache.keys[layer_idx], &k_new], 0)?;
+            kv_cache.values[layer_idx] = Tensor::cat(&[&kv_cache.values[layer_idx], &v_new], 0)?;
+        }
+        let k_cache = &kv_cache.keys[layer_idx]; // [seq_len, num_kv_heads, head_dim]
+        let v_cache = &kv_cache.values[layer_idx];
+
+        // Real SDPA: q [1, num_heads, head_dim] x k_cache^T [num_kv_heads, head_dim, seq_len]
+        // Per GQA: q_head i uses k_cache[kv_head=i//4]
+        // attn_score[q_h, k_pos] = (q[0, q_h] · k_cache[k_pos, q_h//4]) / sqrt(head_dim)
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        // Per-head loop (honest PoC, clearer than broadcast gymnastics)
+        let mut attn_outs = Vec::with_capacity(num_heads);
+        for h in 0..num_heads {
+            let kv_h = h / (num_heads / num_kv_heads);
+            let q_h = q.narrow(1, h, 1)?.squeeze(1)?; // [1, head_dim]
+            let k_h = k_cache.narrow(1, kv_h, 1)?.squeeze(1)?; // [seq_len, head_dim]
+            let v_h = v_cache.narrow(1, kv_h, 1)?.squeeze(1)?; // [seq_len, head_dim]
+            // scores [1, seq_len]
+            let scores = q_h.matmul(&k_h.t()?)?.affine(scale, 0.0)?;
+            // softmax over seq_len dim
+            let weights = candle_nn::ops::softmax_last_dim(&scores)?;
+            // context [1, head_dim]
+            let ctx = weights.matmul(&v_h)?;
+            attn_outs.push(ctx);
+        }
+        // Concat all heads back to [1, num_heads * head_dim]
+        let attn_concat = Tensor::cat(
+            &attn_outs.iter().collect::<Vec<_>>(),
+            1,
+        )?;
+
+        // O projection
+        let o_w = self.builder.get_tensor(&o_name)?;
+        let attn_out = attn_concat.matmul(&o_w.t()?)?;
+        drop(o_w);
+
+        // Residual
+        let hidden_after_attn = (hidden_states + attn_out)?;
+
+        // Post-attention RMSNorm + MLP (unchanged from single-token version)
+        let post_ln = self.builder.get_tensor(&post_ln_name)?;
+        let post_normed = rms_norm(&hidden_after_attn, &post_ln, 1e-6)?;
+        drop(post_ln);
+
+        let mlp_out = self.mlp_block(layer_idx, &post_normed)?;
+        Ok((hidden_after_attn + mlp_out)?)
+    }
+
+    /// Auto-regressive decode loop: feed token, get argmax, repeat N times.
+    /// Each iteration appends to KV cache (real autoregressive behavior).
+    /// RoPE + QK-norm deferred (output quality not coherent Qwen3 but pipeline works).
+    pub fn decode(&self, initial_token: u32, max_new_tokens: usize) -> Result<Vec<u32>> {
+        let mut kv_cache = KVCache::new(self.n_layers, self.builder.device());
+        let mut generated = vec![initial_token];
+
+        for _ in 0..max_new_tokens {
+            let position = generated.len() - 1;
+            let last_token = *generated.last().unwrap();
+            let logits = self.forward_with_kv_cache(last_token, position, &mut kv_cache)?;
+            let next = self.argmax_token(&logits)?;
+            generated.push(next);
+        }
+        Ok(generated)
+    }
+
+    /// Argmax over vocab logits.
+pub fn argmax_token(&self, logits: &Tensor) -> Result<u32> {
+        let logits_vec: Vec<f32> = logits.squeeze(0)?.to_vec1()?;
+        let (idx, _) = logits_vec
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, v)| (i, *v))
+            .unwrap_or((0, 0.0));
+        Ok(idx as u32)
     }
 }
