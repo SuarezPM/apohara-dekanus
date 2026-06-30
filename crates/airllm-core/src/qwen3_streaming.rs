@@ -19,7 +19,7 @@
 //! is documented as Phase 2b-full work in AUDIT D0008.
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{D, DType, Device, Tensor};
 use candle_nn::ops::rms_norm;
 
 use crate::layer_stream_v2::LayerStreamedBuilder;

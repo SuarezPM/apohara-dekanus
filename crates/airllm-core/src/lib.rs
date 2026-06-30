@@ -7,6 +7,7 @@
 #![deny(unsafe_code)]
 
 pub mod config;
+pub mod dispatch;
 pub mod layer_stream;
 pub mod layer_stream_v2;
 pub mod pinned_buffer;
@@ -18,6 +19,7 @@ pub mod rms_norm_cuda;
 pub mod rope_qknorm;
 
 pub use config::EngineConfig;
+pub use dispatch::{narrow, reshape, stack};
 pub use layer_stream::{LayerStream, LayerShard};
 pub use layer_stream_v2::LayerStreamedBuilder;
 pub use pinned_buffer::PinnedHostBuffer;

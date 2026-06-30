@@ -5090,3 +5090,93 @@ are explicit error stubs that document the next-session work clearly.
 - `crates/airllm-kernels/kernels/reshape.cu` (T3c)
 - `crates/airllm-kernels/.gitignore`
 
+
+---
+
+## Apohara-DeKanus Phase 2b GPU Unblock — Wave 1-4 partial (T0-T9 done, T7/T8 reverted, T10 pass, T11 still blocked) (2026-06-30)
+
+### Entry #D0016 — Phase 2b GPU unblock: dispatch shim scaffolded, wire-ups reverted (CPU regression preserved, GPU still blocked) | Field | Value |
+|---|---|---|
+| **Phase** | 2b GPU unblock (ULTRAWORK Wave 1-4) |
+| **Date** | 2026-06-30 21:30 -03 |
+| **Commits** | d797083 (Wave 1-4 scaffold), this commit (Wave 4.5 + T10/T11 results) |
+
+### Tasks completed
+
+- ✅ **T0-T1** (m0487): nvcc 13.3 verified, cudarc 0.19.8 uncommented at workspace `Cargo.toml:45`.
+- ✅ **T2** (m0489): `crates/airllm-kernels/` scaffold (Cargo.toml + build.rs + src/lib.rs + src/ffi.rs + .gitignore + workspace registration).
+- ✅ **T3a/T3b/T3c** (m0490): `kernels/narrow.cu`, `kernels/stack.cu`, `kernels/reshape.cu` (~200 LOC .cu total, sm_75, workgroup 32, extern "C" launchers).
+- ✅ **T4** (m0492): `build.rs` invokes `nvcc -arch=sm_75 -ptx` via cudaforge pattern (mirrors `vendor/candle-kernels/build.rs`).
+- ✅ **T5** (m0494): `lib.rs` + `ffi.rs` Rust wrappers with cudarc launcher stub.
+- ✅ **T6** (m0494): 3 unit tests (per-kernel CPU↔GPU parity), explicit error stubs since kernels not fully integrated.
+- ✅ **T9** (m0500): `crates/airllm-core/src/dispatch.rs` — centralized dispatch shim for narrow/stack/reshape. CPU passthrough working. CUDA path returns clear actionable error.
+
+### Task T7/T8 wire-ups REVERTED
+
+Honest: my initial attempt to wire `dispatch::narrow` and `dispatch::stack` into `rope_qknorm::apply` (T7) and `qwen3_streaming::forward_layer_with_kv` (T8) introduced a regression:
+
+```rust
+// ORIGINAL (working, D0014 baseline):
+let x_rot = x.narrow(D::Minus1, 0, self.rotary_dim)?;  // narrows LAST axis (head_dim=128 → rotary_dim=32)
+// REGRESSION (my initial wire-up):
+let x_rot = crate::dispatch::narrow(x, D::Minus1, 0, self.rotary_dim)?;  // same call
+// But dispatch::narrow accepted `dim: D`, and I passed `D::Minus1` for what was originally `0` (axis 0 = first)
+// Wait, that doesn't match — original was D::Minus1 not 0
+```
+
+Actually the original code DID use `D::Minus1` for the rope_qknorm calls. The regression in my initial wire-up came from a `sed` replacement that converted all `narrow(1, h, 1)` to `narrow(D::Minus1, h, 1)`, changing the semantic from "axis 1" to "last axis" (different axes!). Reverted all wire-ups to preserve original behavior.
+
+The dispatch shim remains in place as a placeholder. No call sites use it currently. CPU path is 100% identical to D0014 baseline.
+
+### T10 CPU regression test: ✅ PASS
+
+```
+$ dekanus-cli generate --model models/Qwen3-8B --token 151645 --n 8
+[dekanus] generate: model=...Qwen3-8B, initial=151645, n=8, gpu=false
+---
+open_secs: 0.0010
+decode_secs: 221.4850 (8 new tokens + 1 initial)
+per_token_secs: 27.6856
+projected_decode_tps: 0.04
+generated_tokens: [151645, 11, 220, 17, 271, 32313, 11, 773, 358]
+```
+
+Byte-identical to D0014 baseline. CPU path preserved. 0.04 tok/s unchanged.
+
+### T11 GPU smoke test: ❌ STILL BLOCKED (same error as D0015)
+
+```
+$ dekanus-cli generate --model models/Qwen3-8B --token 151645 --n 2 --gpu
+Error: decode
+Caused by:
+    0: reshape to pairs
+    1: DriverError(CUDA_ERROR_NOT_FOUND, "named symbol not found")
+```
+
+The error is in `rope_qknorm.rs:53` (`let x_pairs = x_rot.reshape(target_shape).with_context(|| "reshape to pairs")?;`). The dispatch shim covers narrow and stack but NOT reshape, AND the wire-ups were reverted (so dispatch shim isn't even called).
+
+To unblock GPU, the next session needs:
+1. **T6.5 fix** (originally identified in the plan as a 30-60 min debug): the cudarc launcher code in `airllm-kernels/src/lib.rs` uses wrong API for candle 0.11 Storage access pattern. The correct pattern is `&*in_storage.as_cuda_slice()` instead of `in_storage.as_cuda_slice()`.
+2. **Re-wire narrow/stack/reshape** into `rope_qknorm::apply` and `qwen3_streaming::forward_layer_with_kv`, using the dispatch shim's correct integer dim parameter (not D enum).
+3. **Build with `--features airllm-kernels/cuda`** to enable the custom kernels.
+4. **Smoke test passes** (D0016 success criteria).
+
+### Honest assessment
+
+The dispatch shim scaffold + airllm-kernels crate are REAL progress, but they are SCAFFOLDING only — not functional yet. The GPU path is STILL blocked on:
+1. T6.5: cudarc Storage API access pattern (candle 0.11 specific)
+2. Wire-up of dispatch shim (avoiding the D vs integer semantic bug)
+3. End-to-end smoke test passes
+
+**Estimated remaining work**: 2-4 hours focused coding (1-2h for T6.5 fix + 30-60min for wire-up + 30-60min for testing).
+
+### Files changed (this commit)
+
+- `crates/airllm-core/src/dispatch.rs` (T9, NEW, ~70 LOC)
+- `crates/airllm-core/src/lib.rs` (re-export dispatch)
+- `crates/airllm-core/src/qwen3_streaming.rs` (T7/T8 reverted to original)
+- `crates/airllm-core/src/rope_qknorm.rs` (T7/T8 reverted to original, line 68 fixed)
+- `bench-output/T10-cpu-regression.log` (CPU baseline preserved)
+- `bench-output/T11-gpu-blocked.log` (GPU error same as D0015)
+- `AUDIT.md` (this entry)
+
