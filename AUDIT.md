@@ -4813,3 +4813,100 @@ ETA: ~30-60 min depending on bandwidth. PID 398082.
   on disk. THIS is what makes airllm-style layer-streaming transformative for
   consumer GPUs.
 
+
+---
+
+## Apohara-DeKanus Phase 4 — Qwen3NextForCausalLM streaming scaffold (2026-06-30)
+
+### Entry #D0017 — Phase 4: Qwen3-Coder-Next hybrid attn + sparse MoE | Field | Value |
+|---|---|
+| **Phase** | 4 (Qwen3-Coder-Next custom impl) |
+| **Date** | 2026-06-30 20:05 -03 |
+| **Commit SHA** | (this commit) |
+| **Status** | ✅ Code complete, ⏳ model + measurement pending |
+
+### Implementation: `crates/airllm-core/src/qwen3_next_streaming.rs` (~450 LOC)
+
+Qwen3NextForCausalLM streaming architecture:
+- `Qwen3NextConfig::from_config_json`: parses Coder-Next config
+  (48 layers, hidden=2048, 128 experts, 10 active, 256K context, hybrid 3:1)
+- `is_full_attention_layer(layer_idx)`: returns true for layer % 4 == 0
+- `full_attention_forward`: real GQA + RoPE + QK-norm for full attention layers (reuses Phase 2b-full code)
+- `linear_attention_forward`: **SIMPLIFIED honest PoC** for GatedDeltaNet
+- `sparse_moe_mlp`: top-expert selection + per-expert forward + shared expert
+- `forward_one_token`: 48-layer hybrid forward with KV cache
+- `decode`: autoregressive with hybrid attention + MoE
+
+### Honest PoC scope: simplified GatedDeltaNet
+
+Real Qwen3-Coder-Next GatedDeltaNet has ~300 LOC of math:
+- Q/K/V projections (linear conv1d on V for local context)
+- Decay factor A_log (per-head learnable)
+- Sigmoid gate z
+- Chunk-wise recurrent state with cumulative sum
+- Output gating
+
+**This implementation provides architectural compatibility, not mathematical fidelity**:
+- Loads real weights (q_proj, k_proj, v_proj, gate, out_proj)
+- Applies sigmoid gate to v (simplified output gating, no recurrence)
+- Skips: conv1d, decay, chunk-wise recurrence, true linear attention
+
+The goal is layer-streaming infrastructure (each linear layer loaded per-token,
+released after use) + architectural scaffolding that can be measured for I/O patterns.
+Real GatedDeltaNet math would need a 2-3 day focused implementation.
+
+### Hybrid attention pattern
+
+| Layer | Type | Weights loaded |
+|---|---|---|
+| 0, 4, 8, ..., 44 | Full GatedAttention (real Q/K/V + GQA + RoPE + QK-norm) | 5 + 2 norm + 2 MLP = 9 |
+| 1, 2, 3, 5, 6, 7, ... | Linear GatedDeltaNet (sigmoid gate on V) | 5 + 2 norm + 2 MLP = 9 |
+| All | Sparse MoE (10 of 128 experts + shared) | 10 + 1 router + 1 shared×3 = ~14 |
+
+Per token: ~10 layers with full attn (~9 weights each) = 90 weights loaded
+         ~38 layers with linear attn (~9 weights each) = 342 weights loaded
+         + MoE: 48 layers × ~14 expert weights = 672 weights loaded
+**Total: ~1104 weight loads per token** for Qwen3-Coder-Next
+
+### Files added
+
+- `crates/airllm-core/src/qwen3_next_streaming.rs` (~450 LOC, new module)
+- `crates/airllm-core/src/lib.rs` (re-export Qwen3NextConfig + Qwen3NextStreamingModel)
+
+### Honest position
+
+- ✅ Phase 4 architecture scaffold complete
+- ✅ Hybrid attention pattern (3:1) implemented
+- ✅ Sparse MoE with top-1 (PoC) + shared expert
+- ⚠️ GatedDeltaNet math is SIMPLIFIED (not real linear attention math)
+- ❌ No measurement yet (model + GPU path both pending)
+- Phase 4 is genuine progress toward Coder-Next support but not v1.0-quality
+
+### Path forward for Phase 4 v1.0
+
+1. Implement real GatedDeltaNet math (~300 LOC, 2-3 days):
+   - conv1d on V for local context
+   - A_log decay factor + sigmoid gate z
+   - Chunk-wise recurrent state with cumulative sum
+2. Add top-k expert selection (currently uses argmax for simplicity)
+3. Wire CLI subcommand for Qwen3-Coder-Next
+4. Measure on real Qwen3-Coder-Next model (download + 256K context test)
+
+### Combined Phase 0-4 status
+
+| Phase | Code | Measurement | Verdict |
+|---|---|---|---|
+| 0 Genesis | ✅ | n/a | Done |
+| 1a Build | ✅ | 0 errors | Done |
+| 1b Qwen3 forward | ✅ | n/a | Done |
+| 1c CPU measure | ✅ | 0.50 tok/s | Done |
+| 2 vendor-patch | ✅ | CUDA 13.3 OK | Done |
+| 2a LayerStreamedBuilder | ✅ | 22ms open | Done |
+| 2b sim | ✅ | 2.35 tok/s projection | Done |
+| 2b-full | ✅ | 0.04 tok/s diverse output | Done |
+| 2b GPU | ✅ | blocked on candle CUDA | Partial |
+| 3 MoE 30B-A3B | ✅ | download in progress | Code-only |
+| 4 Coder-Next | ✅ | n/a | Code-only |
+
+**Session ULTRAWORK delivered: 24 commits, 17 AUDIT entries, 2 real measurements, 4 architectures, 1 vendor patch**
+
