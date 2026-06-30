@@ -1,17 +1,17 @@
-//! Layer-streaming inference engine core (skeleton).
+//! Layer-streaming inference engine core.
 //!
-//! Pipeline: NVMe (safetensors shard) → glommio executor → pinned-host
-//! double-buffer → cudarc H2D stream → CUDA forward → GPU KV cache →
-//! release layer to next prefetch.
-//!
-//! Phase 1: skeleton modules. Phase 2: candle-nn Qwen3 forward wired.
+//! Phase 1b: Qwen3 forward pass via candle-transformers + std::fs layer streaming.
+//! Phase 2: extend with Qwen3 MoE + sparse expert routing.
+//! Phase 3: extend with custom Qwen3-Next hybrid (linear attention + MoE).
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod config;
 pub mod layer_stream;
 pub mod pinned_buffer;
+pub mod qwen3_runner;
 
 pub use config::EngineConfig;
 pub use layer_stream::{LayerStream, LayerShard};
 pub use pinned_buffer::PinnedHostBuffer;
+pub use qwen3_runner::{Qwen3Runner, Qwen3Variant, RunConfig, RunOutput};
