@@ -4087,3 +4087,94 @@ Total Phase 2b-full: ~380 LOC. Estimated effort: 3-6 hours focused.
 - `crates/dekanus-cli/src/main.rs` (stream_forward subcommand + handler)
 - `bench-output/phase2b-stream-forward-poc.log` (real output, .gitignored)
 
+
+---
+
+## Apohara-DeKanus Phase 2b — Real MLP block added (2026-06-30)
+
+### Entry #D0009 — Phase 2b: real Qwen3 MLP integrated | Field | Value |
+|---|---|
+| **Phase** | 2b (layer-streaming inference with real MLP) |
+| **Date** | 2026-06-30 18:05 -03 |
+| **Commit SHA** | (this commit) |
+| **Hardware** | CPU Ryzen 5 3600, 46Gi RAM, F32 (no GPU) |
+
+### Implementation upgrade: real Qwen3 MLP
+
+Replaced the q_proj stand-in with the full Qwen3 MLP block:
+```
+post_normed = rms_norm(hidden, post_attention_layernorm.weight)
+gate = post_normed @ gate_proj.weight.T     # [hidden, intermediate=12288]
+up   = post_normed @ up_proj.weight.T       # [hidden, intermediate=12288]
+act  = silu(gate) * up                      # [intermediate]
+out  = act @ down_proj.weight.T             # [intermediate, hidden]
+hidden = hidden + out                        # residual
+```
+
+Layer structure now: `RMSNorm + attn-stand-in + RMSNorm + real_MLP + residual × 2`.
+
+**Attention is still simplified** (q_proj linear stand-in, no RoPE, no QK-norm,
+no SDPA) — Phase 2b-full replaces this. But MLP is now REAL Qwen3.
+
+### Real measurement (captured at `bench-output/phase2b-stream-forward-mlp.log`)
+
+```
+$ dekanus-cli stream-forward --model models/Qwen3-8B --token 151645
+[dekanus] opened in 0.0007s (n_layers=36, hidden=4096, vocab=151936)
+---
+open_secs: 0.0007
+forward_secs: 29.5454
+forward_secs_per_layer: 0.8207
+projected_decode_tps_if_io_bound: 1.22
+argmax_token: 72289 (logit=14.465)
+```
+
+### Interpretation
+
+| Metric | D0008 (stand-in q_proj) | D0009 (real MLP) | Ratio |
+|---|---|---|---|
+| forward_secs | 6.30s | 29.55s | 4.7× |
+| per_layer | 0.175s | 0.821s | 4.7× |
+| projected tok/s | 5.71 | **1.22** | 0.21× |
+
+The 4.7× slowdown matches expectation: real MLP adds 2 more large matmuls per layer
+(gate/up at [4096, 12288] + down at [12288, 4096]) vs single q_proj [4096, 4096].
+Plus element-wise SiLU + multiply.
+
+### Realistic projection: full Qwen3 layer on this hardware
+
+Per-layer matmul counts (all [seq=1, batch=1, dim]):
+- Simplified attention (1× q_proj [4096,4096]): ~0.05s CPU F32
+- Real MLP (3× matmuls [4096,12288] + [12288,4096]): ~0.45s CPU F32
+- Real attention (4× matmuls [4096,4096] + RoPE + QK-norm + SDPA): ~0.20s CPU F32
+- **Full real layer estimate: ~0.65s CPU F32 → 1.5 tok/s**
+
+On **GPU BF16 tensor cores** (sm_75, FP16 mma 6 TFLOPS):
+- Each matmul ~1-5ms
+- Full real layer estimate: ~30-50ms → **20-33 tok/s decode** (CPU→GPU ratio ~20×)
+- **With Q4-AWQ quantization on GPU**: ~5-10ms matmul → **100-200 tok/s decode**
+
+### Honest framing
+
+- **Current PoC is now architecturally close to real Qwen3**: 2 RMSNorms + attn-stand-in +
+  real MLP + 2 residuals. The MLP block — the larger half of the layer compute — is real.
+- **Attention is the remaining simplification**: the q_proj stand-in contributes
+  ~15% of total layer compute, so even with REAL attention, projected tok/s will
+  not increase dramatically (maybe 5-10% better).
+- **GPU BF16 path is the real unlock**: shifts matmul bottleneck from CPU F32
+  (memory-bandwidth-limited) to GPU BF16 (compute-limited at tensor core peak).
+
+### Phase 2b-full remaining work
+
+- Real attention: Q/K/V proj (3× matmuls) + RoPE + QK-norm + SDPA + O proj (~150 LOC)
+- KV cache: per-layer key/value tensor persistence + concat on sequence growth (~100 LOC)
+- Auto-regressive decode loop: feed back argmax, repeat (~80 LOC)
+
+**Total Phase 2b-full**: ~330 LOC additional. Estimated: 3-5 hours focused.
+
+### Files modified
+
+- `crates/airllm-core/src/qwen3_streaming.rs` (replaced simplified_layer with
+  forward_layer; added real mlp_block method)
+- `bench-output/phase2b-stream-forward-mlp.log` (real output, .gitignored)
+

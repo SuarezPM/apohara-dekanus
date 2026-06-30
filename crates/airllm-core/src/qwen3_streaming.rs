@@ -86,38 +86,78 @@ impl Qwen3StreamingModel {
         Ok(row)
     }
 
-    /// Simplified decoder layer: RMSNorm + linear + residual.
-    /// NOT Qwen3's actual attention+MLP — this is a PoC that proves the load/use/drop
-    /// cycle for layer weights works. Full attention+MLP is Phase 2b-full work.
-    /// We use self_attn.q_proj.weight [hidden_size, hidden_size] as the linear
-    /// (one of the attention weights) — semantically a stand-in for the full
-    /// attention+MLP block. Honest PoC, not real Qwen3 attention.
-    pub fn forward_simplified_layer(&self, layer_idx: usize, hidden_states: &Tensor) -> Result<Tensor> {
+    /// Real Qwen3 MLP block: gate_proj + up_proj + SiLU(gate)*up + down_proj.
+/// This is the FULL MLP block (not a stand-in). Returns output [1, hidden_size].
+    pub fn mlp_block(&self, layer_idx: usize, post_normed: &Tensor) -> Result<Tensor> {
+        let gate_name = format!("model.layers.{}.mlp.gate_proj.weight", layer_idx);
+        let up_name = format!("model.layers.{}.mlp.up_proj.weight", layer_idx);
+        let down_name = format!("model.layers.{}.mlp.down_proj.weight", layer_idx);
+
+        let gate_w = self
+            .builder
+            .get_tensor(&gate_name)
+            .with_context(|| format!("loading {}", gate_name))?;
+        let gate = post_normed.matmul(&gate_w.t()?).with_context(|| "mlp gate_proj")?;
+        drop(gate_w);
+
+        let up_w = self
+            .builder
+            .get_tensor(&up_name)
+            .with_context(|| format!("loading {}", up_name))?;
+        let up = post_normed.matmul(&up_w.t()?).with_context(|| "mlp up_proj")?;
+        drop(up_w);
+
+        // SiLU(gate) * up
+        let silu_gate = candle_nn::ops::silu(&gate).with_context(|| "silu")?;
+        let act = (silu_gate * up).with_context(|| "act = silu(gate) * up")?;
+
+        let down_w = self
+            .builder
+            .get_tensor(&down_name)
+            .with_context(|| format!("loading {}", down_name))?;
+        let out = act.matmul(&down_w.t()?).with_context(|| "mlp down_proj")?;
+        drop(down_w);
+
+        Ok(out)
+    }
+
+    /// Decoder layer: 2 RMSNorms + simplified attention stand-in (RMSNorm + linear) + real MLP.
+    /// Honest: attention is simplified (no RoPE, no QK-norm, no SDPA), MLP is real Qwen3.
+    /// Phase 2b-full replaces simplified attention with real Q/K/V/RoPE/QK-norm/SDPA/O.
+    pub fn forward_layer(&self, layer_idx: usize, hidden_states: &Tensor) -> Result<Tensor> {
         let input_ln_name = format!("model.layers.{}.input_layernorm.weight", layer_idx);
+        let post_ln_name = format!("model.layers.{}.post_attention_layernorm.weight", layer_idx);
         let q_proj_name = format!("model.layers.{}.self_attn.q_proj.weight", layer_idx);
 
-        // Load input_layernorm.weight [hidden_size] and apply RMSNorm
+        // Pre-attention: input_layernorm + simplified attention stand-in (RMSNorm + q_proj linear)
         let ln_weight = self
             .builder
             .get_tensor(&input_ln_name)
             .with_context(|| format!("loading {}", input_ln_name))?;
-        let normed = rms_norm(hidden_states, &ln_weight, 1e-6)
-            .with_context(|| "RMSNorm forward")?;
+        let pre_normed = rms_norm(hidden_states, &ln_weight, 1e-6)
+            .with_context(|| "pre_attention RMSNorm")?;
         drop(ln_weight);
 
-        // Load self_attn.q_proj.weight [hidden_size, hidden_size] and apply linear
         let q_weight = self
             .builder
             .get_tensor(&q_proj_name)
             .with_context(|| format!("loading {}", q_proj_name))?;
-        let projected = normed
-            .matmul(&q_weight.t()?)
-            .with_context(|| "matmul with q_proj.weight")?;
+        let attn_out = pre_normed.matmul(&q_weight.t()?).with_context(|| "attn stand-in")?;
         drop(q_weight);
 
-        // Residual: hidden + projected (simplified; full layer would have attention+MLP)
-        let output = (hidden_states + projected)
-            .with_context(|| "residual add")?;
+        let hidden_after_attn = (hidden_states + attn_out).with_context(|| "attn residual")?;
+
+        // Pre-MLP: post_attention_layernorm + real MLP (gate + up + SiLU + down)
+        let post_ln = self
+            .builder
+            .get_tensor(&post_ln_name)
+            .with_context(|| format!("loading {}", post_ln_name))?;
+        let post_normed = rms_norm(&hidden_after_attn, &post_ln, 1e-6)
+            .with_context(|| "post_attention RMSNorm")?;
+        drop(post_ln);
+
+        let mlp_out = self.mlp_block(layer_idx, &post_normed)?;
+        let output = (hidden_after_attn + mlp_out).with_context(|| "mlp residual")?;
         Ok(output)
     }
 
@@ -134,13 +174,14 @@ impl Qwen3StreamingModel {
         Ok(logits)
     }
 
-    /// Forward a single token through embed → N simplified layers → lm_head.
+    /// Forward a single token through embed → N decoder layers → lm_head.
+    /// Uses real Qwen3 MLP block + simplified attention stand-in.
     /// Returns logits [vocab_size].
     pub fn forward_one_token(&self, token_id: u32) -> Result<Tensor> {
         let mut hidden = self.embed(token_id)?;
         // hidden shape: [1, hidden_size]
         for layer_idx in 0..self.n_layers {
-            hidden = self.forward_simplified_layer(layer_idx, &hidden)?;
+            hidden = self.forward_layer(layer_idx, &hidden)?;
         }
         // Final norm + lm_head (Qwen3 has model.norm.weight at end before lm_head)
         let final_norm = self
