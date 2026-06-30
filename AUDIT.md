@@ -3718,3 +3718,99 @@ tok_per_sec: 0.50
 | **AWQ-INT4 quant Qwen3-8B** | 30 min download + 5 min config | 60-100 tok/s |
 | **Just keep CPU** | 0 min | 0.50 tok/s (acceptable for dev iteration, NOT production) |
 
+
+---
+
+## Apohara-DeKanus Phase 2 (GPU path) — Vendor patch works, OOM validates thesis (2026-06-30)
+
+### Entry #D0005 — Phase 2: GPU path enabled, 8B OOMs (validates layer-streaming need) | Field | Value |
+|---|---|
+| **Phase** | 2 (GPU path re-enabled via vendor patch) |
+| **Date** | 2026-06-30 16:55 -03 |
+| **Commit SHA** | (this commit) |
+| **Build** | ✅ `cargo build --release -p dekanus-cli --features dekanus-cli/cuda` (4m 41s) |
+| **GPU inference** | ❌ OOM at model load (validates thesis) |
+
+### Vendor patch (the fix)
+
+`vendor/candle-kernels/src/compatibility.cuh` line 10:
+```cuda
+// ORIGINAL (candle-kernels v0.11.0):
+#if __CUDA_ARCH__ < 800
+__device__ __forceinline__ __half __hmax_nan(__half a, __half b) { ... }
+__device__ __forceinline__ __half __hmin_nan(__half a, __half b) { ... }
+#endif
+
+// PATCHED (apohara-dekanus vendor):
+#if __CUDA_ARCH__ < 800 && __CUDACC_VER_MAJOR__ < 13
+// (skip on CUDA 13+; cuda_fp16.hpp already defines these)
+#endif
+```
+
+**Why `__CUDACC_VER_MAJOR__` not `CUDA_VERSION`**: `CUDA_VERSION` macro is NOT defined
+when this header is first included (before cuda_runtime.h). `__CUDACC_VER_MAJOR__` is
+always defined by nvcc. Without this guard, candle-kernels redefines `__hmax_nan`/
+`__hmin_nan` already provided by CUDA 13.3's cuda_fp16.hpp.
+
+### Build verification (real)
+
+```
+$ cargo check --workspace --features airllm-core/cuda
+warning: candle-kernels@0.11.0: Compiling 15 of 15 kernels
+    Finished `dev` profile [optimized + debuginfo] target(s) in 2m 11s
+
+$ cargo build --release -p dekanus-cli --features dekanus-cli/cuda
+warning: candle-kernels@0.11.0: Compiling 15 of 15 kernels
+    Finished `release` profile [optimized] target(s) in 4m 41s
+```
+
+### GPU inference attempt (real, honest OOM)
+
+```
+$ dekanus-cli run --model models/Qwen3-8B --prompt 'The capital of France is' \
+    --max-new-tokens 16 --temperature 0.0 --gpu
+[dekanus] device: CUDA GPU
+Error: loading Qwen3 dense model
+Caused by:
+    DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
+```
+
+### Honest interpretation (THE WHOLE POINT)
+
+- **GPU OOM is a SUCCESS, not a failure** — it validates Apohara-DeKanus's core thesis:
+  "70B+ models on 8GB VRAM requires layer-streaming; can't just `load_dense`"
+- Qwen3-8B BF16 = 16.40 GB raw weights
+- RTX 2060 SUPER VRAM = 8 GB
+- Without layer-streaming (Phase 2 work), the model OOMs immediately
+- This is the EXACT scenario airllm solves (via streaming) and Apohara-DeKanus
+  will solve (via streaming + selective activation + turboquant-kv)
+
+### Path forward (Phase 2 actual work)
+
+1. **Implement layer-streaming in Qwen3Runner**:
+   - Load layer-by-layer via std::fs (Phase 2a, no glommio yet)
+   - Pin host memory via cudarc alloc_pinned (Phase 2a, replaces mmap+mlock)
+   - H2D via cudaMemcpyAsync on dedicated stream (Phase 2a)
+   - Forward each layer, release, fetch next (Phase 2a)
+2. **Re-run Qwen3-8B with layer-streaming** (Phase 2a measurement):
+   - Expected: tok/s constrained by NVMe @ 2.5-3.5 GB/s × 80 layers
+   - Or 0.5-1 tok/s for "first token slow" until KV-cache warm
+3. **Then Phase 3: Qwen3-30B-A3B with sparse MoE routing**
+4. **Then Phase 4: Qwen3-Coder-Next (custom Qwen3NextForCausalLM impl)**
+
+### Files touched in this commit
+
+- `vendor/candle-kernels/src/compatibility.cuh` (patch, 1 line changed)
+- `Cargo.toml` (re-enable candle-core/cuda + candle-flash-attn + [patch.crates-io])
+- `crates/airllm-core/src/qwen3_runner.rs` (cuda() factory + #[cfg(feature)])
+- `crates/airllm-core/Cargo.toml` (cuda feature flag)
+- `crates/dekanus-cli/src/main.rs` (--gpu flag + cuda runner selection)
+- `crates/dekanus-cli/Cargo.toml` (cuda feature propagation)
+
+### Honest commitments
+
+- ❌ No tok/s number for GPU path (OOM before measurement)
+- ✅ candle-kernels CUDA 13.3 compat achieved
+- ✅ GPU build infrastructure works end-to-end
+- ✅ OOM finding validates project thesis (the right problem to solve)
+

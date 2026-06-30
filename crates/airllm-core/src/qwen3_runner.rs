@@ -84,6 +84,14 @@ impl Qwen3Runner {
         Self::new(Device::Cpu, DType::F32)
     }
 
+    /// CUDA device (sm_75 supported via vendor-patched candle-kernels).
+    /// Returns Self on CUDA device 0 with BF16 dtype (best for Qwen3 8B).
+    #[cfg(feature = "cuda")]
+    pub fn cuda() -> Result<Self> {
+        let device = Device::new_cuda(0).with_context(|| "creating CUDA device 0")?;
+        Ok(Self::new(device, DType::BF16))
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }

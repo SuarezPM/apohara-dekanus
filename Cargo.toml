@@ -45,14 +45,12 @@ parking_lot = "0.12"
 # cudarc = { version = "0.19", features = ["cuda-12050"] }
 
 # ML
-# Phase 1: CPU-only candle to avoid candle-kernels v0.11.0 / CUDA 13.3 incompatibility
-# (candle-kernels ships compatibility.cuh that redefines __hmax_nan/__hmin_nan
-# already present in cuda_fp16.hpp from CUDA 13.3 — same issue that caused
-# mistral.rs to drop sm_75 on 2026-06-13).
-# Phase 2 will vendor-patch candle-kernels and re-enable cuda + flash-attn.
-candle-core = { version = "0.11" }
+# Phase 2: vendor-patch candle-kernels (compatibility.cuh +CUDA_VERSION<13000)
+# re-enables cuda + flash-attn for sm_75 (RTX 2060 SUPER) + CUDA 13.3.
+candle-core = { version = "0.11", features = ["cuda"] }
 candle-nn = "0.11"
 candle-transformers = "0.11"
+candle-flash-attn = "0.11"
 safetensors = "0.4"
 
 # Tokenization
@@ -73,6 +71,11 @@ sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
+
+# Vendor patch: candle-kernels v0.11.0 + CUDA 13.3 compat
+# (see vendor/candle-kernels/src/compatibility.cuh patch notes)
+[patch.crates-io]
+candle-kernels = { path = "vendor/candle-kernels" }
 
 [profile.release]
 opt-level = 3

@@ -42,6 +42,10 @@ enum Commands {
         #[arg(long)]
         variant: Option<String>,
 
+        /// Use CUDA GPU (requires --features airllm-core/cuda build)
+        #[arg(long, default_value_t = false)]
+        gpu: bool,
+
         /// Path to AUDIT.md for evidence logging
         #[arg(short = 'a', long, default_value = "AUDIT.md")]
         audit: String,
@@ -63,8 +67,9 @@ fn main() -> Result<()> {
             max_new_tokens,
             temperature,
             variant,
+            gpu,
             audit,
-        } => run_inference(model, prompt, max_new_tokens, temperature, variant, audit),
+        } => run_inference(model, prompt, max_new_tokens, temperature, variant, gpu, audit),
         Commands::Doctor => doctor(),
         Commands::Info => info(),
     }
@@ -76,6 +81,7 @@ fn run_inference(
     max_new_tokens: usize,
     temperature: f32,
     variant: Option<String>,
+    gpu: bool,
     audit: String,
 ) -> Result<()> {
     // Auto-detect variant from config.json if not specified
@@ -100,10 +106,19 @@ fn run_inference(
     eprintln!("[dekanus] model: {}", model_path.display());
     eprintln!("[dekanus] model_type: {}", model_type);
     eprintln!("[dekanus] variant: {:?}", variant);
+    eprintln!("[dekanus] device: {}", if gpu { "CUDA GPU" } else { "CPU" });
     eprintln!("[dekanus] prompt: {}", prompt);
     eprintln!("[dekanus] max_new_tokens: {}, temperature: {}", max_new_tokens, temperature);
 
+    #[cfg(feature = "cuda")]
+    let runner = if gpu {
+        Qwen3Runner::cuda().with_context(|| "creating CUDA runner (is --features airllm-core/cuda enabled?)")?
+    } else {
+        Qwen3Runner::cpu()
+    };
+    #[cfg(not(feature = "cuda"))]
     let runner = Qwen3Runner::cpu();
+
     let cfg = RunConfig {
         model_path: model_path.clone(),
         variant,

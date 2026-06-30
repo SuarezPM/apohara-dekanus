@@ -27,3 +27,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
+
+[features]
+default = []
+cuda = ["airllm-core/cuda"]
