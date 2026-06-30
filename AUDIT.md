@@ -3524,3 +3524,55 @@ ask the user to decide.
 - Enable `gpu` feature flag in airllm-core (currently always-on in workspace)
 - Verify `cargo check -p dekanus-cli` passes (minimal crate without GPU deps)
 
+
+---
+
+## Apohara-DeKanus Phase 1a — Build infrastructure (2026-06-30)
+
+### Entry #D0002 — Phase 1a: cargo check --workspace passes | Field | Value |
+|---|---|
+| **Phase** | 1a (Build infrastructure) |
+| **Date** | 2026-06-30 16:10 -03 |
+| **Commit SHA** | (this commit) |
+| **Status** | ✅ cargo check --workspace: 0 errors, 0 warnings |
+| **Binary** | dekanus-cli built + runs `info` command successfully |
+
+### Build fixes applied (4 issues, all honest root causes)
+
+| # | Issue | Root cause | Fix |
+|---|---|---|---|
+| 1 | candle-kernels v0.11.0 PTX build fails | compatibility.cuh redefines `__hmax_nan`/`__hmin_nan` already in CUDA 13.3 cuda_fp16.hpp | CPU-only candle for Phase 1; vendor-patch in Phase 2 |
+| 2 | glommio v0.9.0 liburing C build fails | vendored liburing struct open_how pointer-type mismatch vs glibc | Remove glommio for Phase 1 (in-VRAM 8B doesn't need io_uring); re-add in Phase 2 |
+| 3 | z3-sys 0.8.1 CMake build fails | "Compatibility with CMake < 3.5 has been removed" | Bumped z3 to 0.20 |
+| 4 | airllm-core pinned_buffer.rs unsafe blocks | violated `#![forbid(unsafe_code)]` | Rewrote as CPU-only `Vec<u8>` placeholder; Phase 2 uses cudarc with proper unsafe annotation |
+
+### Evidence (real, not fabricated)
+
+```
+$ cargo check --workspace
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.12s
+
+$ cargo build -p dekanus-cli
+    Finished `dev` profile [optimized + debuginfo] target(s) in 1m 20s
+
+$ cargo run -p dekanus-cli --quiet -- info
+apohara-dekanus 0.1.0
+Workspace crates: airllm-core, dekanus-cli, dekanus-selective,
+                   dekanus-quant-kv, dekanus-llmlingua2, dekanus-rag,
+                   dekanus-romy, audit-honesty
+```
+
+### Phase 1b prerequisites (next session)
+- Vendor-patch candle-kernels (or fork) to add `#ifndef` guards around __hmax_nan/__hmin_nan
+- Download Qwen3-8B safetensors (~16GB FP16) to local `models/` directory
+- Implement `dekanus-cli run --model <path>` with candle CPU forward pass
+- Wire layer-streaming loop (std::fs reads, no glommio yet)
+- Implement token sampling + simple greedy decoding
+- Benchmark: tok/s measurement + AUDIT.md entry D0003
+
+### Honest position
+- ❌ No speed benchmarks yet (Phase 1b requires actual model + forward pass)
+- ✅ Workspace compiles end-to-end with all 8 crates
+- ✅ Binary runs and outputs expected info
+- ⚠️ GPU path deferred to Phase 2 (candle-kernels patch needed)
+
