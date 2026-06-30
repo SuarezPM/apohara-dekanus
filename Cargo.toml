@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/airllm-core",
+    "crates/airllm-kernels",
     "crates/dekanus-cli",
     "crates/dekanus-selective",
     "crates/dekanus-quant-kv",
@@ -42,7 +43,7 @@ core_affinity = "0.8"
 parking_lot = "0.12"
 
 # CUDA / GPU (sm_75 Turing: RTX 2060 SUPER) — re-enabled in Phase 2 after vendor-patch
-# cudarc = { version = "0.19", features = ["cuda-12050"] }
+cudarc = { version = "0.19", features = ["cuda-12050"] }
 
 # ML
 # Phase 2: vendor-patch candle-kernels (compatibility.cuh +CUDA_VERSION<13000)

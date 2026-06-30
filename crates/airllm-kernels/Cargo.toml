@@ -1,0 +1,27 @@
+[package]
+name = "airllm-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Custom CUDA kernels (sm_75) to unblock candle-core 0.11 narrow/stack on GPU"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+# Phase 2b GPU path: cudarc for kernel loading and launch
+cudarc = { workspace = true, optional = true }
+candle-core = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+# cudaforge: build helper that scans .cu files, invokes nvcc, generates Rust bindings
+cudaforge = "0.1.2"

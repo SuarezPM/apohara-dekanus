@@ -56,6 +56,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "airllm-kernels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "cudaforge",
+ "cudarc 0.19.8",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
