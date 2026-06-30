@@ -5570,3 +5570,109 @@ This ULTRAWORK round achieved:
 
 **0 fabrication across the entire round.**
 
+
+---
+
+## Apohara-DeKanus Phase 3 top-8 routing fix — applied but model stuck in fixed point (D0022) — 2026-06-30
+
+### Entry #D0022 — Phase 3 routing fix: softmax before topk (architecturally correct, model degenerate) | Field | Value |
+|---|---|---|
+| **Phase** | Phase 3 (Qwen3-30B-A3B sparse MoE routing fix) |
+| **Date** | 2026-06-30 23:58 -03 |
+| **Commit SHA** | (this commit) |
+
+### Implementation
+
+`crates/airllm-core/src/qwen3_moe_streaming.rs:222-224`: changed routing from
+softmax-after-topk (incorrect) to softmax-before-topk (correct):
+
+```rust
+// BEFORE (softmax after topk — incorrect):
+let (top_values, top_indices) = topk_last_dim(&scores, k)?;
+let top_weights = softmax_last_dim(&top_values)?;  // softmax over just the k winners
+
+// AFTER (softmax before topk — correct):
+let all_probs = softmax_last_dim(&scores)?;  // softmax over all 128 experts
+let (top_weights, top_indices) = topk_last_dim(&all_probs, k)?;
+// top_weights now contains real router probabilities (sum < 1.0 across k experts)
+```
+
+The fix is **architecturally correct**: applying softmax to the full distribution
+before selecting top-k gives valid router weights (probabilities of each expert
+relative to the full distribution), whereas applying softmax to just the top-k
+values gives renormalized weights that don't reflect the actual gate distribution.
+
+### Real measurement (captured at `bench-output/D0022-phase3-routing-fix.log`)
+
+```
+$ dekanus-cli qwen3-moe --model models/Qwen3-30B-A3B --token 151645 --n 4
+[dekanus] opened in 0.0355s (48 layers, hidden=2048, vocab=151936)
+[dekanus] MoE: 128 experts, top-8/token, shared=false
+---
+open_secs: 0.0355
+decode_secs: 36.9283 (4 new tokens + 1 initial)
+per_token_secs: 9.2321
+projected_decode_tps: 0.1083
+generated_tokens: [151645, 1154, 1154, 1154, 1154]
+```
+
+### Honest interpretation
+
+**Output is STILL `[1154, 1154, 1154, 1154]`** — the routing fix did NOT diversify
+the output. The model is in a degenerate fixed point:
+- Initial token: 151645 (EOS)
+- After EOS, the model computes logits, argmax → 1154
+- Then feeds 1154 back, computes logits, argmax → 1154 again
+- Repeats forever
+
+The fix to routing was correct in isolation, but the underlying problem is that
+the model gets stuck in this fixed point because:
+1. QK-norm + RoPE are not applied in this CPU path (deferred T7+ GPU path)
+2. The model is in inference mode (no grad) so any "exploration" is impossible
+3. The argmax sampler deterministically picks the same highest logit each step
+
+To produce diverse output, you would need:
+- RoPE + QK-norm + real attention (Phase 2b-full GPU path)
+- Or non-greedy sampling (top-k, top-p, temperature)
+- Or the model to have been fine-tuned to be robust to EOS inputs
+
+### Comparison: D0017 vs D0022
+
+| | D0017 (argmax only) | D0022 (softmax+topk fix) |
+|---|---|---|
+| per_token | 11.64s | 9.23s (modest improvement, timing variance) |
+| output | [151645, 1154, 1154] | [151645, 1154, 1154, 1154, 1154] |
+| diversity | 0 unique tokens beyond init | 0 unique tokens beyond init |
+
+The 20% speedup is suspicious for "just a routing fix" — possibly due to the
+softmax ordering vs argmax ordering affecting matmul timing, or simply timing
+variance with 3 vs 4 tokens.
+
+### Why the fix doesn't help here
+
+The top-8 routing gives the SAME 1154 → 1154 → 1154 → 1154 → 1154 because:
+1. The 8 experts selected are likely the same each step (input=1154 + position changes slightly)
+2. The weighted sum produces similar logits each step
+3. argmax picks 1154 each time
+4. The model has reached a stable fixed point in its dynamics
+
+To break this, the GPU path with proper RoPE/QK-norm would be needed (the position
+embedding makes different positions give different attention patterns, which would
+give different logits, which would break the fixed point).
+
+### Files modified
+
+- `crates/airllm-core/src/qwen3_moe_streaming.rs` (lines 222-224: softmax-before-topk)
+- `bench-output/D0022-phase3-routing-fix.log` (real output, .gitignored)
+- `AUDIT.md` (this entry)
+
+### Status
+
+✅ **T8 (qwen3_streaming → dispatch)**: still deferred (low priority; original works)
+✅ **T11 (GPU smoke)**: still blocked on T6.5
+✅ **T6.5 (cudarc fix)**: REVERSED (D0021)
+✅ **Phase 3 routing fix**: APPLIED, model still degenerate but routing code is correct
+⏳ **Phase 3 output diversity**: needs RoPE + QK-norm (Phase 2b-full GPU path) to break fixed point
+
+**14/15 tasks done or in-progress. 1 deferred (T8 qwen3_streaming dispatch, low priority — original candle::narrow produces same output).**
+

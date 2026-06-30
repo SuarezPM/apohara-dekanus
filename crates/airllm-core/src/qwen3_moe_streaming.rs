@@ -219,9 +219,11 @@ impl Qwen3MoeStreamingModel {
         let scores = hidden_states.matmul(&gate_w.t()?)?; // [1, num_experts=128]
         drop(gate_w);
 
-        // 2. Top-k selection
-        let (top_values, top_indices) = topk_last_dim(&scores, self.config.num_experts_per_tok as usize)?;
-        let top_weights = candle_nn::ops::softmax_last_dim(&top_values)?; // normalize router weights
+        // 2. Top-k selection (softmax BEFORE topk to get valid router weights over
+        // the full expert distribution, not just renormalized over the k winners).
+        let all_probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let (top_weights, top_indices) = topk_last_dim(&all_probs, self.config.num_experts_per_tok as usize)?;
+        // top_weights now contains real router probabilities (sum to < 1.0 across 8 experts).
 
         // 3. For each selected expert, compute and accumulate
         let mut output = Tensor::zeros(
