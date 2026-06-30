@@ -63,6 +63,17 @@ enum Commands {
         #[arg(short, long)]
         model: PathBuf,
     },
+
+    /// Forward a single token through Qwen3 with layer-streaming (Phase 2b PoC)
+    StreamForward {
+        /// Model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Token ID to embed + forward through all layers + lm_head
+        #[arg(short, long)]
+        token: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -80,6 +91,7 @@ fn main() -> Result<()> {
         Commands::Doctor => doctor(),
         Commands::Info => info(),
         Commands::Inspect { model } => inspect_model(&model),
+        Commands::StreamForward { model, token } => stream_forward(&model, token),
     }
 }
 
@@ -183,6 +195,65 @@ fn info() -> Result<()> {
     println!("                   dekanus-quant-kv, dekanus-llmlingua2, dekanus-rag,");
     println!("                   dekanus-romy, audit-honesty");
     println!("Phase: 1b (Qwen3 dense forward pass via candle-transformers)");
+    Ok(())
+}
+
+fn stream_forward(model_dir: &std::path::Path, token_id: u32) -> Result<()> {
+    use airllm_core::Qwen3StreamingModel;
+    use candle_core::{DType, Device};
+
+    eprintln!(
+        "[dekanus] stream-forward: model={}, token={}",
+        model_dir.display(),
+        token_id
+    );
+
+    let device = Device::Cpu;
+    let dtype = DType::F32;
+
+    let open_start = std::time::Instant::now();
+    let model = Qwen3StreamingModel::open(model_dir, device, dtype)
+        .with_context(|| "opening Qwen3StreamingModel")?;
+    let open_secs = open_start.elapsed().as_secs_f64();
+
+    eprintln!(
+        "[dekanus] opened in {:.4}s (n_layers={}, hidden={}, vocab={})",
+        open_secs,
+        model.n_layers(),
+        model.hidden_size(),
+        model.vocab_size()
+    );
+
+    let fwd_start = std::time::Instant::now();
+    let logits = model
+        .forward_one_token(token_id)
+        .with_context(|| "forward_one_token")?;
+    let fwd_secs = fwd_start.elapsed().as_secs_f64();
+
+    let logits_vec: Vec<f32> = logits.squeeze(0)?.to_vec1()?;
+    let (argmax_idx, argmax_val) = logits_vec
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, v)| (i, *v))
+        .unwrap_or((0, 0.0));
+
+    println!("---");
+    println!("open_secs: {:.4}", open_secs);
+    println!("forward_secs: {:.4}", fwd_secs);
+    println!(
+        "forward_secs_per_layer: {:.4}",
+        fwd_secs / model.n_layers() as f64
+    );
+    println!(
+        "projected_decode_tps_if_io_bound: {:.2}",
+        1.0 / (fwd_secs / model.n_layers() as f64)
+    );
+    println!("argmax_token: {} (logit={:.3})", argmax_idx, argmax_val);
+    println!("---");
+    println!("Phase 2b PoC: layer-streaming inference primitive works (load -> use -> release per layer).");
+    println!("Phase 2b-full: full Qwen3 attention + MLP + KV cache + decode loop (multi-day).");
+
     Ok(())
 }
 
