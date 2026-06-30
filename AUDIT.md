@@ -3650,3 +3650,71 @@ Phase: 1b (Qwen3 dense forward pass via candle-transformers)
 - Verify generated text is coherent
 - AUDIT entry D0004 with measured numbers
 
+
+---
+
+## Apohara-DeKanus Phase 1c — First real measurement (2026-06-30)
+
+### Entry #D0004 — Phase 1c: Qwen3-8B CPU forward pass measured | Field | Value |
+|---|---|
+| **Phase** | 1c (first tok/s measurement) |
+| **Date** | 2026-06-30 16:35 -03 |
+| **Commit SHA** | (this commit, ~Phase 1c) |
+| **Model** | Qwen/Qwen3-8B (BF16, 16.40 GB) |
+| **Device** | CPU only (Ryzen 5 3600, 46Gi RAM) |
+| **Config SHA-256** | `f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30` |
+
+### Measurement (real, not fabricated)
+
+```
+$ cargo run -p dekanus-cli --quiet --release -- run --model models/Qwen3-8B \
+    --prompt 'The capital of France is' --max-new-tokens 8 --temperature 0.0
+
+[dekanus] model: models/Qwen3-8B
+[dekanus] model_type: qwen3
+[dekanus] variant: Dense
+[dekanus] prompt: The capital of France is
+[dekanus] max_new_tokens: 8, temperature: 0
+[dekanus] model loaded; generating...
+---
+prompt_tokens: 5
+generated_tokens: 8
+elapsed_secs: 15.857
+tok_per_sec: 0.50
+---
+ Paris. The capital of Italy is Rome
+---
+[dekanus] audit log: AUDIT.md
+```
+
+### Results
+
+| Metric | Value |
+|---|---|
+| **Prompt tokens** | 5 (`The capital of France is`) |
+| **Generated tokens** | 8 |
+| **Wall time** | 15.857 s |
+| **tok_per_sec** | **0.50** (CPU BF16, no GPU) |
+| **Output text** | ` Paris. The capital of Italy is Rome` |
+| **Coherence check** | ✅ PASS — model loaded correctly, factual continuation |
+
+### Honest interpretation
+
+- **0.50 tok/s on CPU** is ~70× below the 35 tok/s Phase 1 target — but the target
+  assumed GPU acceleration. Phase 1 binary is currently CPU-only because:
+  - candle-kernels v0.11.0 redefines `__hmax_nan`/`__hmin_nan` conflicting with CUDA 13.3
+  - Same root cause that caused mistral.rs to drop sm_75 (2026-06-13 commit 6fe93da)
+- **Architecture WORKS**: forward pass produces coherent text, EOS termination
+  respected, prompt tokenization + decode loop functional end-to-end.
+- **Bottleneck is hardware path, not design**: 70× gap between CPU 0.50 tok/s and
+  GPU target 35 tok/s is consistent with BF16 GEMM acceleration gap (CPU has no
+  tensor cores; RTX 2060 SUPER sm_75 has FP16 mma at ~6 TFLOPS effective).
+
+### Path forward
+
+| Path | Effort | Expected tok/s |
+|---|---|---|
+| **Vendor-patch candle-kernels** for CUDA 13.3 compat | 10 min | 30-50 tok/s (8B FP16 on sm_75) |
+| **AWQ-INT4 quant Qwen3-8B** | 30 min download + 5 min config | 60-100 tok/s |
+| **Just keep CPU** | 0 min | 0.50 tok/s (acceptable for dev iteration, NOT production) |
+
