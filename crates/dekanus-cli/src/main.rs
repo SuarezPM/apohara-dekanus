@@ -86,6 +86,21 @@ enum Commands {
         tokens: Vec<u32>,
     },
 
+    /// Generate from Qwen3-30B-A3B (sparse MoE layer-streaming, Phase 3)
+    Qwen3Moe {
+        /// Model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Initial token ID
+        #[arg(short, long)]
+        token: u32,
+
+        /// Number of new tokens to generate
+        #[arg(short = 'n', long, default_value_t = 4)]
+        n: usize,
+    },
+
     /// Auto-regressive generate from initial token with KV cache (Phase 2b-full multi-token)
     Generate {
         /// Model directory
@@ -124,6 +139,7 @@ fn main() -> Result<()> {
         Commands::StreamForward { model, token } => stream_forward(&model, token),
         Commands::ForwardTokens { model, tokens } => forward_tokens(&model, &tokens),
         Commands::Generate { model, token, n, gpu } => generate(&model, token, n, gpu),
+        Commands::Qwen3Moe { model, token, n } => qwen3_moe_generate(&model, token, n),
     }
 }
 
@@ -410,6 +426,67 @@ fn generate(model_dir: &std::path::Path, initial_token: u32, max_new: usize, gpu
         println!("Phase 2b-full CPU path: KV cache + decode loop (F32).");
     }
     println!("Pipeline: real autoregressive generation with RoPE + QK-norm + KV cache.");
+
+    Ok(())
+}
+
+fn qwen3_moe_generate(model_dir: &std::path::Path, initial_token: u32, max_new: usize) -> Result<()> {
+    use airllm_core::Qwen3MoeStreamingModel;
+    use candle_core::{DType, Device};
+
+    eprintln!(
+        "[dekanus] qwen3-moe: model={}, initial={}, n={}",
+        model_dir.display(),
+        initial_token,
+        max_new
+    );
+
+    let device = Device::Cpu;
+    let dtype = DType::F32;
+
+    let open_start = std::time::Instant::now();
+    let model = Qwen3MoeStreamingModel::open(model_dir, device, dtype)
+        .with_context(|| "opening Qwen3MoeStreamingModel")?;
+    let open_secs = open_start.elapsed().as_secs_f64();
+
+    eprintln!(
+        "[dekanus] opened in {:.4}s ({} layers, hidden={}, vocab={})",
+        open_secs,
+        model.config.n_layers,
+        model.config.hidden_size,
+        model.config.vocab_size
+    );
+    eprintln!(
+        "[dekanus] MoE: {} experts, top-{}/token, shared={}",
+        model.config.num_experts,
+        model.config.num_experts_per_tok,
+        model.config.shared_expert
+    );
+
+    let decode_start = std::time::Instant::now();
+    let generated = model
+        .decode(initial_token, max_new)
+        .with_context(|| "decode")?;
+    let decode_secs = decode_start.elapsed().as_secs_f64();
+
+    println!("---");
+    println!("open_secs: {:.4}", open_secs);
+    println!(
+        "decode_secs: {:.4} ({} new tokens + 1 initial)",
+        decode_secs,
+        max_new
+    );
+    println!(
+        "per_token_secs: {:.4}",
+        decode_secs / max_new as f64
+    );
+    println!(
+        "projected_decode_tps: {:.4}",
+        1.0 / (decode_secs / max_new as f64)
+    );
+    println!("generated_tokens: {:?}", generated);
+    println!("---");
+    println!("Phase 3: Qwen3-30B-A3B sparse MoE layer-streaming (CPU F32).");
 
     Ok(())
 }

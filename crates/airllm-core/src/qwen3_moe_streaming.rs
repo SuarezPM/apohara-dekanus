@@ -56,7 +56,7 @@ impl Qwen3MoeConfig {
             num_experts: v["num_experts"].as_u64().unwrap_or(128) as usize,
             num_experts_per_tok: v["num_experts_per_tok"].as_u64().unwrap_or(8) as usize,
             moe_intermediate_size: v["moe_intermediate_size"].as_u64().unwrap_or(768) as usize,
-            shared_expert: v["shared_expert"].as_str().map(|s| s == "true").unwrap_or(true),
+            shared_expert: v["shared_expert"].as_str().map(|s| s == "true").unwrap_or(false),
             rope_theta: v["rope_theta"].as_f64().unwrap_or(1_000_000.0),
             max_position_embeddings: v["max_position_embeddings"].as_u64().unwrap_or(40960) as usize,
         })
