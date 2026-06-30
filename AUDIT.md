@@ -3465,3 +3465,62 @@ ask the user to decide.
 ---
 
 *Last updated: 2026-06-12 (Ralph Step 7 architect review APPROVED, awaiting /oh-my-claudecode:cancel to clean up state files). All 13 commits pushed to origin/main.*
+
+---
+
+## Apohara-DeKanus Phase 0 — Genesis (2026-06-30)
+
+### Entry #D0001 — Phase 0 completion claim | Field | Value |
+|---|---|
+| **Phase** | 0 (Genesis) |
+| **Date** | 2026-06-30 15:45 -03 |
+| **Commit SHA** | `8f907de` |
+| **Branch** | (none, local only) |
+| **Author** | Pablo (SuarezPM@protonmail.com) |
+| **Reviewer** | self (Phase 0) |
+
+### Hardware fingerprint
+| Component | Value |
+|---|---|
+| GPU | NVIDIA GeForce RTX 2060 SUPER (sm_75 / Turing, 8GB GDDR6) |
+| CUDA toolkit | 13.3 |
+| CPU | AMD Ryzen 5 3600 (Zen 2, 6C/12T, no NUMA, no AMX) |
+| RAM | 16GB DDR4 declared (46Gi measured total) |
+| NVMe | Gen3 (3.5 GB/s peak, 2.5 GB/s sustained expected) |
+| Kernel | CachyOS linux 7.0.7.arch2-1 (2026-05-14) |
+
+### Deliverables (43 files, 8402 insertions)
+- ✅ Workspace Cargo.toml with cudarc 0.19, glommio 0.9, candle, half, bytemuck, core_affinity, memmap2, tokio, thiserror, z3, sha2, hex, chrono, uuid, clap, tracing
+- ✅ 8 crates skeleton:
+  - `airllm-core` — layer-stream engine modules (config, layer_stream, pinned_buffer)
+  - `dekanus-cli` — clap-based CLI binary (run / doctor / info)
+  - `dekanus-selective` — SelectivePolicy trait + NoOpPolicy + LayerSet
+  - `dekanus-quant-kv` — stub modules (FWHT, quantize, dequantize, kv_cache)
+  - `dekanus-llmlingua2` — stub modules (chunker, classifier, compressor)
+  - `dekanus-rag` — stub modules (codec, store)
+  - `dekanus-romy` — stub modules (cache_salt, invariants)
+  - `audit-honesty` — claim, fingerprint, ledger primitives
+- ✅ AUDIT.md (3467 lines, 204KB) carried verbatim from Apohara_Context_Forge
+- ✅ scripts/check_honesty.sh (146 lines) — CI guard
+- ✅ .github/workflows/honesty.yml (21 lines) — GitHub Actions workflow
+- ✅ LICENSE (Apache 2.0)
+- ✅ README.md — project intro + roadmap table + workspace layout
+- ✅ .gitignore — Rust + model weights + AUDIT temp
+
+### Build status (honest)
+- ❌ `cargo check --workspace` fails with two distinct issues:
+  - **candle-kernels v0.11.0**: PTX kernel build needs CUDA toolkit properly in PATH (`nvcc` + `CUDA_HOME` env var). System has nvcc 13.3 but build script can't find it (no `/usr/local/cuda` symlink, only `cuda-13.3` package).
+  - **glommio v0.9.0**: bundled liburing has C compatibility issues with newer glibc (likely needs older liburing-sys or use system io_uring headers from kernel ≥5.7).
+- 🔧 These are environment issues, not project issues. Phase 1 task: resolve CUDA setup + glommio io_uring bindings.
+
+### Honesty ledger commitments
+- **No fabricated benchmarks**: This entry only claims file presence and structure.
+- **No fabricated tok/s numbers**: No speed claims made; targets in README are aspirational.
+- **AUDIT.md is append-only**: All Phase entries follow the format above.
+
+### Phase 1 prerequisites (next session)
+- Install CUDA 13.x properly with `CUDA_HOME` env var (`export CUDA_HOME=/opt/cuda`)
+- Resolve glommio liburing issue (either patch vendored liburing or use system headers via `bindgen`)
+- Enable `gpu` feature flag in airllm-core (currently always-on in workspace)
+- Verify `cargo check -p dekanus-cli` passes (minimal crate without GPU deps)
+
