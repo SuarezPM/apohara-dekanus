@@ -1,0 +1,19 @@
+[package]
+name = "dekanus-romy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "ROMY multi-agent safety protocol (cache_salt + Z3-proven INV-15)"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[dependencies]
+z3 = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }

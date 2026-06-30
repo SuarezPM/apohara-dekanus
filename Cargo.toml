@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/airllm-core",
+    "crates/dekanus-cli",
+    "crates/dekanus-selective",
+    "crates/dekanus-quant-kv",
+    "crates/dekanus-llmlingua2",
+    "crates/dekanus-rag",
+    "crates/dekanus-romy",
+    "crates/audit-honesty",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/SuarezPM/apohara-dekanus"
+authors = ["Pablo <SuarezPM@protonmail.com>"]
+keywords = ["llm", "inference", "moe", "layer-streaming", "nanite", "consumer-gpu"]
+categories = ["command-line-utilities", "science", "development-tools"]
+
+[workspace.dependencies]
+# Math / data
+half = { version = "2.4", features = ["bytemuck"] }
+bytemuck = { version = "1.18", features = ["derive"] }
+memmap2 = "0.9"
+ndarray = "0.16"
+ndarray-stats = "0.6"
+
+# Errors / serialization
+thiserror = "1.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Concurrency / async
+tokio = { version = "1.40", features = ["full"] }
+glommio = "0.9"
+core_affinity = "0.8"
+parking_lot = "0.12"
+
+# CUDA / GPU (sm_75 Turing: RTX 2060 SUPER)
+cudarc = { version = "0.19", features = ["cuda-12050"] }
+
+# ML
+candle-core = { version = "0.11", features = ["cuda"] }
+candle-nn = "0.11"
+candle-transformers = "0.11"
+candle-flash-attn = "0.11"
+safetensors = "0.4"
+
+# Tokenization
+tokenizers = { version = "0.21", features = ["http"] }
+
+# Logging / profiling
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Z3 (verified safety)
+z3 = { version = "0.12", features = ["static-link-z3"] }
+
+# Telemetry / evidence (AUDIT.md)
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.dev]
+opt-level = 1
+
+# sm_75 build.rs flags for cudarc-derived crates
+[workspace.metadata.cudarc.sm75]
+gencode = "arch=compute_75,code=sm_75"
+undefine = ["__CUDA_NO_BF16_OPERATORS__"]

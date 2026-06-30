@@ -1,0 +1,39 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Model weights (never commit)
+/models
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+
+# Cache
+.cache/
+.cargo-cache/
+
+# AUDIT temp (working files, not ledger)
+/AUDIT-tmp/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.key
+*.pem
+
+# Local benchmark artifacts (regenerable)
+/bench-output/
+/profiles/

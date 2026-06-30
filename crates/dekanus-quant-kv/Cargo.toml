@@ -1,0 +1,21 @@
+[package]
+name = "dekanus-quant-kv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "KV cache quantization (FWHT 3-bit + Lloyd-Max + TurboQuant PQO for sm_75)"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[dependencies]
+half = { workspace = true }
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+cudarc = { workspace = true }
+candle-core = { workspace = true }
+tracing = { workspace = true }

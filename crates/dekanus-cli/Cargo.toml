@@ -1,0 +1,29 @@
+[package]
+name = "dekanus-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CLI binary for Qwen3-8B / Qwen3-30B-A3B / Qwen3-Coder-NNext / Ornith-1.0-397B inference"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[dependencies]
+airllm-core = { path = "../airllm-core" }
+dekanus-selective = { path = "../dekanus-selective" }
+dekanus-quant-kv = { path = "../dekanus-quant-kv" }
+dekanus-llmlingua2 = { path = "../dekanus-llmlingua2" }
+dekanus-rag = { path = "../dekanus-rag" }
+dekanus-romy = { path = "../dekanus-romy" }
+audit-honesty = { path = "../audit-honesty" }
+
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
