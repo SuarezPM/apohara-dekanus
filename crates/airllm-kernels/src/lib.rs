@@ -1,34 +1,34 @@
-//! Custom CUDA kernel dispatch for candle-core 0.11 missing narrow/stack.
+//! Custom CUDA kernel dispatch for candle-core 0.11 missing narrow/stack/reshape.
 //!
-//! Phase 2b GPU unblock: when `device.is_cuda()`, would call our
-//! nvcc-compiled kernels via cudarc. When CPU, falls back to candle's
-//! built-in ops.
+//! ## Status (m0582 — honest end-of-session)
 //!
-//! ## Status (m0494 — honest)
+//! The FFI binding structure is in place (`ffi.rs` declares the `extern "C"`
+//! launchers matching `kernels/*.cu`). The Rust wrappers compile cleanly.
 //!
-//! The CUDA FFI binding structure is in place (`ffi.rs` declares the
-//! `extern "C"` launchers matching `kernels/*.cu`). The Rust wrappers
-//! (`narrow`/`stack`/`reshape`) compile-check against candle-core 0.11.
+//! **CUDA execution path is a no-op** because extracting the cudarc `Device`
+//! handle from candle's `CudaDevice` wrapper requires non-public candle
+//! internals (`inner()` method does not exist on `candle_core::CudaDevice`).
+//! This is a candle-core 0.11 API design choice — the wrapper is not
+//! intended to be unwrapped from outside.
 //!
-//! **CUDA execution path is a no-op** in this commit because
-//! candle-core 0.11's `Storage` API requires a different access pattern
-//! (`storage_and_layout().0.as_cuda_slice()` is no longer exposed in the
-//! same form as earlier versions). Wiring the actual cudarc calls
-//! against the current candle-core API is deferred to T7+ in the plan.
+//! ## Path forward (T6.5 deferred)
 //!
-//! What this commit DOES:
-//! - Compiles cleanly both with and without --features cuda
-//! - CPU path works (candle built-in narrow/stack/reshape)
-//! - `device.is_cuda()` is correctly detected
-//! - The dispatch structure is right; only the inner FFI call is stubbed
+//! 1. **Approach A**: vendor-patch candle-core to expose `inner()` on CudaDevice
+//!    (or implement the cudarc kernel launch via the existing `candle_kernels`
+//!    crate pattern that the candle team itself uses).
+//! 2. **Approach B**: bypass candle's Tensor wrapper for the CUDA path —
+//!    load PTX via cudarc directly, manage device pointers manually. Loses
+//!    candle's safe-Tensor handle but enables full custom kernel control.
+//! 3. **Approach C**: wait for candle 0.12+ to add the missing CUDA kernels
+//!    upstream (unlikely in near term; candle's own issue tracker has
+//!    `narrow CUDA kernel` open since 0.9).
 //!
-//! What this commit DOES NOT do yet:
-//! - Actually call our custom CUDA kernels
-//! - Replaces candle's CUDA narrow/stack with our fast path
-//!
-//! **The GPU path is still BLOCKED on full FFI integration**, but the
-//! scaffolding, ffi.rs declarations, and dispatch structure are in place
-//! for a future session to finish (T7+ per the ULTRAWORK plan).
+//! Both Approaches A and B are multi-hour work (1-3h each) with high
+//! debugging risk because they require understanding candle-core's internal
+//! storage abstractions deeply. The current PoC correctly establishes
+//! ALL the surrounding scaffolding (FFI signatures, dispatch shim, .cu
+//! source code with real math, PTX compiled and embedded) — only the
+//! final cudarc Device handle extraction is missing.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -38,7 +38,8 @@ pub mod ffi;
 use anyhow::{Context, Result};
 use candle_core::{DType, Shape, Tensor};
 
-/// Narrow (slice) along a single dimension.
+/// Narrow (slice along a dim) — public API. CPU passthrough to candle;
+/// CUDA returns clean error explaining the missing T6.5 step.
 pub fn narrow(
     t: &Tensor,
     dim: usize,
@@ -52,27 +53,22 @@ pub fn narrow(
     }
 }
 
-fn narrow_cuda(
-    t: &Tensor,
-    dim: usize,
-    start: usize,
-    length: usize,
-) -> Result<Tensor> {
-    // TODO: candle-core 0.11 Storage API changed. The right access
-    // pattern in 0.11 is `t.storage_and_layout().0.deref()` to get
-    // `&Storage`, then `cuda_storage.as_cuda_slice()` returns
-    // `&CudaStorageSlice`. Wire this with cudarc 0.19 once Storage
-    // API access is sorted. For now: error with informative message.
-    let _ = (dim, start, length);
-    anyhow::bail!(
-        "narrow_cuda: candle-core 0.11 Storage FFI not yet wired (see T7+ in plan)"
-    )
+fn narrow_cuda(_t: &Tensor, _dim: usize, _start: usize, _length: usize) -> Result<Tensor> {
+    // T6.5 deferred: extract cudarc Device from candle's CudaDevice wrapper.
+    // The wrapper doesn't expose `.inner()`, so launching our PTX kernel
+    // requires either vendoring candle-core or bypassing Tensor entirely
+    // (raw cudarc + manual device management).
+    Err(anyhow::anyhow!(
+        "narrow_cuda: cudarc Device handle extraction from candle-core 0.11 \
+         CudaDevice wrapper is not exposed (T6.5 deferred). See \
+         crates/airllm-kernels/src/lib.rs comment for path forward."
+    ))
 }
 
-/// Stack (concat along new dim) of N tensors of the same shape.
+/// Stack (concat along new dim).
 pub fn stack(tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
     if tensors.is_empty() {
-        anyhow::bail!("stack requires at least one tensor");
+        return Err(anyhow::anyhow!("stack requires at least one tensor"));
     }
     if tensors[0].device().is_cuda() {
         stack_cuda(tensors, dim)
@@ -84,13 +80,12 @@ pub fn stack(tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
 }
 
 fn stack_cuda(_tensors: &[&Tensor], _dim: usize) -> Result<Tensor> {
-    // TODO: same as narrow_cuda — wire after Storage FFI sorted.
-    anyhow::bail!(
-        "stack_cuda: candle-core 0.11 Storage FFI not yet wired (see T7+ in plan)"
-    )
+    Err(anyhow::anyhow!(
+        "stack_cuda: T6.5 deferred (see narrow_cuda comment)"
+    ))
 }
 
-/// Reshape (strided element copy with new shape).
+/// Reshape.
 pub fn reshape(t: &Tensor, shape: Shape) -> Result<Tensor> {
     if t.device().is_cuda() {
         reshape_cuda(t, &shape)
@@ -100,8 +95,7 @@ pub fn reshape(t: &Tensor, shape: Shape) -> Result<Tensor> {
 }
 
 fn reshape_cuda(_t: &Tensor, _shape: &Shape) -> Result<Tensor> {
-    // TODO: same as narrow_cuda — wire after Storage FFI sorted.
-    anyhow::bail!(
-        "reshape_cuda: candle-core 0.11 Storage FFI not yet wired (see T7+ in plan)"
-    )
+    Err(anyhow::anyhow!(
+        "reshape_cuda: T6.5 deferred (see narrow_cuda comment)"
+    ))
 }

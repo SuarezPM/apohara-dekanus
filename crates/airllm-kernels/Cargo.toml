@@ -6,22 +6,22 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Custom CUDA kernels (sm_75) to unblock candle-core 0.11 narrow/stack on GPU"
+description = "Custom CUDA kernels for candle-core 0.11 ops that lack GPU impls (narrow/stack/reshape)"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
 [features]
-default = []
-cuda = ["dep:cudarc"]
+default = ["cuda"]
+cuda = []
 
 [dependencies]
-# Phase 2b GPU path: cudarc for kernel loading and launch
-cudarc = { workspace = true, optional = true }
 candle-core = { workspace = true }
+cudarc = { workspace = true, features = ["cuda-12050"] }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 
 [build-dependencies]
-# cudaforge: build helper that scans .cu files, invokes nvcc, generates Rust bindings
 cudaforge = "0.1.2"

@@ -19,7 +19,7 @@ use candle_core::{D, Tensor};
 pub fn narrow(t: &Tensor, dim: D, start: usize, length: usize) -> Result<Tensor> {
     if t.device().is_cuda() {
         Err(anyhow!(
-            "narrow CUDA dispatch not yet wired (T6.5 fix pending). \
+            "narrow CUDA dispatch not yet wired (T6.5 deferred). \
              CPU passthrough works; for GPU, see AUDIT D0019."
         ))
     } else {

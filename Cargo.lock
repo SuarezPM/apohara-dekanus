@@ -35,6 +35,7 @@ dependencies = [
 name = "airllm-core"
 version = "0.1.0"
 dependencies = [
+ "airllm-kernels",
  "anyhow",
  "bytemuck",
  "candle-core",
@@ -63,7 +64,6 @@ dependencies = [
  "candle-core",
  "cudaforge",
  "cudarc 0.19.8",
- "thiserror 1.0.69",
 ]
 
 [[package]]

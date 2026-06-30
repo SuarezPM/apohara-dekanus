@@ -29,3 +29,5 @@ pub use qwen3_runner::{Qwen3Runner, Qwen3Variant, RunConfig, RunOutput};
 pub use qwen3_streaming::Qwen3StreamingModel;
 pub use rms_norm_cuda::rms_norm_cuda;
 pub use rope_qknorm::{qk_norm, RoPETables};
+
+use candle_core::shape::Dim;
