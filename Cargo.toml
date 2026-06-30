@@ -73,8 +73,12 @@ hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 
-# Vendor patch: candle-kernels v0.11.0 + CUDA 13.3 compat
-# (see vendor/candle-kernels/src/compatibility.cuh patch notes)
+# Vendor patches for T6.5 fix (custom CUDA kernel integration)
+# - candle-kernels: CUDA 13.3 compat (compatibility.cuh)
+# - candle-core: ATTEMPTED but reverted (m0602) — vendor-patch API mismatches
+#   compound, would require 2-4h focused debugging of candle-core 0.11 internals
+#   (cudarc_device() patch needed DeviceId::as_index() which doesn't exist;
+#   the actual API to get a cudarc Device from CudaDevice is undocumented).
 [patch.crates-io]
 candle-kernels = { path = "vendor/candle-kernels" }
 
@@ -91,3 +95,7 @@ opt-level = 1
 [workspace.metadata.cudarc.sm75]
 gencode = "arch=compute_75,code=sm_75"
 undefine = ["__CUDA_NO_BF16_OPERATORS__"]
+
+# Vendor patch notes for candle-core: T6.5 reversal (m0602) — see [patch.crates-io]
+# section above. The vendor/ copy remains for reference but is NOT in the patch
+# table; the 5+ iteration API mismatch cost exceeded remaining context.
