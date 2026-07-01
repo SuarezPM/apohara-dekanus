@@ -35,8 +35,11 @@ impl RoPETables {
     /// Apply partial RoPE to x with cos/sin for given position.
     pub fn apply(&self, x: &Tensor, position: usize) -> Result<Tensor> {
         use candle_core::D;
-        let cos = &self.cos[position];
-        let sin = &self.sin[position];
+        // cos/sin are precomputed F32 on CPU. On GPU, x may be BF16 (mixed-dtype
+        // model forward). Cast cos/sin to match x's dtype so broadcast_mul works.
+        let x_dtype = x.dtype();
+        let cos = self.cos[position].to_dtype(x_dtype)?;
+        let sin = self.sin[position].to_dtype(x_dtype)?;
         let half = self.rotary_dim / 2;
         let head_dim = x.dim(D::Minus1)?;
         let pass_dim = head_dim - self.rotary_dim;
@@ -50,7 +53,8 @@ impl RoPETables {
         let mut target_shape: Vec<usize> = x_rot_dims[..x_rot_dims.len() - 1].to_vec();
         target_shape.push(half);
         target_shape.push(2);
-        let x_pairs = x_rot.reshape(target_shape).with_context(|| "reshape to pairs")?;
+        let x_pairs = crate::dispatch::reshape(&x_rot, &target_shape)
+            .with_context(|| "reshape to pairs")?;
         let x_pairs_shape: Vec<usize> = x_pairs.dims().to_vec();
         let x_real = crate::dispatch::narrow(&x_pairs, D::Minus1, 0, 1)?.squeeze(D::Minus1)?;
         let x_imag = crate::dispatch::narrow(&x_pairs, D::Minus1, 1, 1)?.squeeze(D::Minus1)?;
@@ -59,17 +63,28 @@ impl RoPETables {
         if let Some(last) = cos_shape.last_mut() {
             *last = half;
         }
-        let cos_b = cos.reshape(cos_shape.clone())?;
-        let sin_b = sin.reshape(cos_shape)?;
+        let cos_b = crate::dispatch::reshape(&cos, &cos_shape)?;
+        let sin_b = crate::dispatch::reshape(&sin, &cos_shape)?;
 
-        let new_real = (x_real.broadcast_mul(&cos_b)? - x_imag.broadcast_mul(&sin_b)?)?;
-        let new_imag = (x_real.broadcast_mul(&sin_b)? + x_imag.broadcast_mul(&cos_b)?)?;
+        // Tensor::mul lacks a CUDA kernel for BF16 broadcast (D0015's "possibly
+        // others" category). Use the F32 dance: cast both operands to F32, do
+        // the mul, cast back. This is the cost of running on candle 0.11's
+        // incomplete CUDA coverage; optimized BF16 broadcast_mul kernel is a
+        // post-T11 task.
+        let x_real_f32 = if x_real.dtype() == DType::F32 { x_real } else { x_real.to_dtype(DType::F32)? };
+        let x_imag_f32 = if x_imag.dtype() == DType::F32 { x_imag } else { x_imag.to_dtype(DType::F32)? };
+        let cos_b_f32 = if cos_b.dtype() == DType::F32 { cos_b } else { cos_b.to_dtype(DType::F32)? };
+        let sin_b_f32 = if sin_b.dtype() == DType::F32 { sin_b } else { sin_b.to_dtype(DType::F32)? };
+        let new_real_f32 = (x_real_f32.broadcast_mul(&cos_b_f32)? - x_imag_f32.broadcast_mul(&sin_b_f32)?)?;
+        let new_imag_f32 = (x_real_f32.broadcast_mul(&sin_b_f32)? + x_imag_f32.broadcast_mul(&cos_b_f32)?)?;
+        let new_real = if new_real_f32.dtype() == DType::F32 && x_dtype == DType::BF16 { new_real_f32.to_dtype(DType::BF16)? } else { new_real_f32 };
+        let new_imag = if new_imag_f32.dtype() == DType::F32 && x_dtype == DType::BF16 { new_imag_f32.to_dtype(DType::BF16)? } else { new_imag_f32 };
 
         let new_pairs = crate::dispatch::stack(&[&new_real, &new_imag], D::Minus1)?;
         // Collapse last two dims (half, 2) back into rotary_dim
-        let x_rot_out = new_pairs.reshape(x_rot_dims.clone())?;
+        let x_rot_out = crate::dispatch::reshape(&new_pairs, &x_rot_dims)?;
 
-        Ok(Tensor::cat(&[&x_rot_out, &x_pass], D::Minus1)?)
+        Ok(crate::dispatch::cat(&[&x_rot_out, &x_pass], D::Minus1)?)
     }
 }
 

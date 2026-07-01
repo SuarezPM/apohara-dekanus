@@ -118,8 +118,8 @@ impl Qwen3StreamingModel {
         drop(up_w);
 
         // SiLU(gate) * up
-        let silu_gate = candle_nn::ops::silu(&gate).with_context(|| "silu")?;
-        let act = (silu_gate * up).with_context(|| "act = silu(gate) * up")?;
+        let silu_gate = crate::dispatch::silu(&gate).with_context(|| "silu")?;
+        let act = crate::dispatch::mul(&silu_gate, &up).with_context(|| "act = silu(gate) * up")?;
 
         let down_w = self
             .builder
@@ -154,34 +154,42 @@ pub fn attention_block(&self, layer_idx: usize, pre_normed: &Tensor) -> Result<T
         .builder
         .get_tensor(&q_name)
         .with_context(|| format!("loading {}", q_name))?;
-    let q = pre_normed.matmul(&q_w.t()?)?.reshape((1, num_heads, head_dim))?;
+    let q = crate::dispatch::reshape(
+        &pre_normed.matmul(&q_w.t()?)?,
+        &[1, num_heads, head_dim],
+    )?;
     drop(q_w);
 
     let k_w = self
         .builder
         .get_tensor(&k_name)
         .with_context(|| format!("loading {}", k_name))?;
-    let _k = pre_normed.matmul(&k_w.t()?)?.reshape((1, num_kv_heads, head_dim))?;
+    let _k = crate::dispatch::reshape(
+        &pre_normed.matmul(&k_w.t()?)?,
+        &[1, num_kv_heads, head_dim],
+    )?;
     drop(k_w);
 
     let v_w = self
         .builder
         .get_tensor(&v_name)
         .with_context(|| format!("loading {}", v_name))?;
-    let v = pre_normed.matmul(&v_w.t()?)?.reshape((1, num_kv_heads, head_dim))?;
+    let v = crate::dispatch::reshape(
+        &pre_normed.matmul(&v_w.t()?)?,
+        &[1, num_kv_heads, head_dim],
+    )?;
     drop(v_w);
 
     // Single-token decode: GQA attention reduces to attn_out[q_h] = v[kv_h] where kv_h = q_h // 4
     // (no softmax needed since only 1 key per query head, softmax(1) = 1)
     // RoPE + QK-norm deferred (would modify q and k before this step).
     // Expand v from [1, 8, 128] to [1, 32, 128] via GQA repeat (each q_head uses its kv_head)
-    let v_expanded = v
-        .reshape((1, num_kv_heads, 1, head_dim))?
-        .broadcast_as((1, num_kv_heads, num_heads / num_kv_heads, head_dim))?
-        .reshape((1, num_heads, head_dim))?;
+    let v_expanded = crate::dispatch::reshape(&v, &[1, num_kv_heads, 1, head_dim])?
+        .broadcast_as((1, num_kv_heads, num_heads / num_kv_heads, head_dim))?;
+    let v_expanded = crate::dispatch::reshape(&v_expanded, &[1, num_heads, head_dim])?;
 
     // Concatenate back to [1, hidden_size]
-    let attn_concat = v_expanded.reshape((1, hidden_size))?;
+    let attn_concat = crate::dispatch::reshape(&v_expanded, &[1, hidden_size])?;
     // Cast to F32 if needed (matmul result might be BF16 if we ran on GPU)
     let attn_concat = if attn_concat.dtype() != DType::F32 {
         attn_concat.to_dtype(DType::F32)?
@@ -219,7 +227,7 @@ pub fn forward_layer(&self, layer_idx: usize, hidden_states: &Tensor) -> Result<
     drop(ln_weight);
 
     let attn_out = self.attention_block(layer_idx, &pre_normed)?;
-    let hidden_after_attn = (hidden_states + attn_out).with_context(|| "attn residual")?;
+    let hidden_after_attn = crate::dispatch::add(hidden_states, &attn_out).with_context(|| "attn residual")?;
 
     let post_ln = self
         .builder
@@ -355,15 +363,24 @@ impl Qwen3StreamingModel {
 
         // Q/K/V projections
         let q_w = self.builder.get_tensor(&q_name)?;
-        let q = pre_normed.matmul(&q_w.t()?)?.reshape((1, num_heads, head_dim))?;
+        let q = crate::dispatch::reshape(
+            &pre_normed.matmul(&q_w.t()?)?,
+            &[1, num_heads, head_dim],
+        )?;
         drop(q_w);
 
         let k_w = self.builder.get_tensor(&k_name)?;
-        let k_new = pre_normed.matmul(&k_w.t()?)?.reshape((1, num_kv_heads, head_dim))?;
+        let k_new = crate::dispatch::reshape(
+            &pre_normed.matmul(&k_w.t()?)?,
+            &[1, num_kv_heads, head_dim],
+        )?;
         drop(k_w);
 
         let v_w = self.builder.get_tensor(&v_name)?;
-        let v_new = pre_normed.matmul(&v_w.t()?)?.reshape((1, num_kv_heads, head_dim))?;
+        let v_new = crate::dispatch::reshape(
+            &pre_normed.matmul(&v_w.t()?)?,
+            &[1, num_kv_heads, head_dim],
+        )?;
         drop(v_w);
 
         // Apply RoPE to q and k_new at this position (Qwen3 partial_rotary_factor=0.25)
@@ -387,8 +404,8 @@ impl Qwen3StreamingModel {
             kv_cache.keys[layer_idx] = k_new.clone();
             kv_cache.values[layer_idx] = v_new.clone();
         } else {
-            kv_cache.keys[layer_idx] = Tensor::cat(&[&kv_cache.keys[layer_idx], &k_new], 0)?;
-            kv_cache.values[layer_idx] = Tensor::cat(&[&kv_cache.values[layer_idx], &v_new], 0)?;
+            kv_cache.keys[layer_idx] = crate::dispatch::cat(&[&kv_cache.keys[layer_idx], &k_new], 0)?;
+            kv_cache.values[layer_idx] = crate::dispatch::cat(&[&kv_cache.values[layer_idx], &v_new], 0)?;
         }
         let k_cache = &kv_cache.keys[layer_idx]; // [seq_len, num_kv_heads, head_dim]
         let v_cache = &kv_cache.values[layer_idx];
@@ -404,21 +421,29 @@ impl Qwen3StreamingModel {
             let q_h = crate::dispatch::narrow(&q, D::Minus2, h, 1)?.squeeze(1)?; // [1, head_dim]
             let k_h = crate::dispatch::narrow(k_cache, D::Minus2, kv_h, 1)?.squeeze(1)?; // [seq_len, head_dim]
             let v_h = crate::dispatch::narrow(v_cache, D::Minus2, kv_h, 1)?.squeeze(1)?; // [seq_len, head_dim]
+            // F32 dance for the attention body: candle 0.11's CUDA backend
+            // lacks kernels for BF16 affine / broadcast_sub / broadcast_div.
+            // Cast q/k/v to F32, do the body, cast ctx back to original dtype.
+            // This is a known T11-blocker documented in D0015/D0025.
+            let q_h_f32 = q_h.to_dtype(DType::F32)?;
+            let k_h_f32 = k_h.to_dtype(DType::F32)?;
+            let v_h_f32 = v_h.to_dtype(DType::F32)?;
             // scores [1, seq_len]
-            let scores = q_h.matmul(&k_h.t()?)?.affine(scale, 0.0)?;
-            // softmax over seq_len dim (manual: subtract max for numerical
-            // stability, exp, normalize — all ops have CUDA impls in candle 0.11).
+            let scores = q_h_f32.matmul(&k_h_f32.t()?)?.affine(scale, 0.0)?;
+            // softmax over seq_len dim (subtract max for numerical stability,
+            // exp, normalize — F32 ops have CUDA impls in candle 0.11).
             let max_scores = scores.max_keepdim(candle_core::D::Minus1)?;
             let shifted = scores.broadcast_sub(&max_scores)?;
             let exp_scores = shifted.exp()?;
             let sum_exp = exp_scores.sum_keepdim(candle_core::D::Minus1)?;
             let weights = exp_scores.broadcast_div(&sum_exp)?;
             // context [1, head_dim]
-            let ctx = weights.matmul(&v_h)?;
-            attn_outs.push(ctx);
+            let ctx = weights.matmul(&v_h_f32)?;
+            let ctx_back = if q.dtype() == DType::BF16 { ctx.to_dtype(DType::BF16)? } else { ctx };
+            attn_outs.push(ctx_back);
         }
         // Concat all heads back to [1, num_heads * head_dim]
-        let attn_concat = Tensor::cat(
+        let attn_concat = crate::dispatch::cat(
             &attn_outs.iter().collect::<Vec<_>>(),
             1,
         )?;
@@ -429,7 +454,7 @@ impl Qwen3StreamingModel {
         drop(o_w);
 
         // Residual
-        let hidden_after_attn = (hidden_states + attn_out)?;
+        let hidden_after_attn = crate::dispatch::add(hidden_states, &attn_out)?;
 
         // Post-attention RMSNorm + MLP (unchanged from single-token version)
         let post_ln = self.builder.get_tensor(&post_ln_name)?;
@@ -437,7 +462,7 @@ impl Qwen3StreamingModel {
         drop(post_ln);
 
         let mlp_out = self.mlp_block(layer_idx, &post_normed)?;
-        Ok((hidden_after_attn + mlp_out)?)
+        Ok(crate::dispatch::add(&hidden_after_attn, &mlp_out)?)
     }
 
     /// Auto-regressive decode loop: feed token, get argmax, repeat N times.
@@ -459,7 +484,13 @@ impl Qwen3StreamingModel {
 
     /// Argmax over vocab logits.
 pub fn argmax_token(&self, logits: &Tensor) -> Result<u32> {
-        let logits_vec: Vec<f32> = logits.squeeze(0)?.to_vec1()?;
+        // to_vec1 requires F32 (CPU-side cast). On GPU, logits is BF16.
+        let logits_cpu = if logits.device().is_cuda() {
+            logits.to_dtype(DType::F32)?.squeeze(0)?.to_vec1()?
+        } else {
+            logits.squeeze(0)?.to_vec1()?
+        };
+        let logits_vec: Vec<f32> = logits_cpu;
         let (idx, _) = logits_vec
             .iter()
             .enumerate()
