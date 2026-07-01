@@ -6428,3 +6428,124 @@ hot path.
 
 **No fabrication** in this entire round.
 
+---
+
+## Apohara-DeKanus v2.2 plan initial: phased roadmap from Perplexity (D0030) — 2026-07-01
+
+### Entry #D0030 — v2.2 plan: phased synthesis of Perplexity Deep Research output | Field | Value |
+|---|---|---|
+| **Phase** | Phase 0 (Bootstrap) of v2.2 |
+| **Date** | 2026-07-01 18:35 -03 |
+| **Commits** | (this commit) |
+| **Perplexity source** | `/home/thelinconx/Descargas/apohara-dekanus-v2.2.md` (2122 lines, synthesized 2026-07-01) |
+
+### TL;DR
+
+The Perplexity Deep Research output has been synthesized into a
+**phased plan** (no time estimates, per Pablo's instruction) committed
+to `forge/plans/apohara-dekanus-v2.2.md`. The plan covers 7 phases
+(Phase 0 = Bootstrap, Phase 1-6 = technical work, Phase 7 =
+production integration) with each phase having a definition-of-done,
+verification gate, AUDIT.md entry reservation, and honest performance
+expectations derived from bandwidth math.
+
+### Why phases, not time
+
+The user explicitly requested a plan structured as **phases with
+definition-of-done**, not calendar weeks/months. Phases here mean:
+- A phase is a verifiable milestone. It ends with a green benchmark
+  or a green test that proves the previous bottleneck is solved.
+- A phase commits to main. Each phase generates ≥1 AUDIT.md entries
+  (D0031-D0050) before merging.
+- A phase has a gate. Either the gate passes (phase done) or it
+  doesn't (phase reworked, not bypassed).
+- A phase may have sub-phases. When natural, but each sub-phase is
+  itself a verifiable milestone.
+
+### Phase structure
+
+| Phase | Perplexity Tier | Scope | Gate |
+|---|---|---|---|
+| 0 (Bootstrap) | — | Plan commit, D0030, README update | v2.2 plan committed |
+| 1 (Kernels) | T1 | 6 missing BF16 kernels (mul, silu, cat, reshape, affine, stack) | Model-path test green, 6 D-entries |
+| 2 (CUDA Graphs) | T2 | cudarc 0.19 graph capture with bucket-based shape variants | tok/s ≥ 1.1× Phase 1, p99 < 1.5× p50 |
+| 3 (Quantization) | T4 | Q4_K_M dequant-to-FP16, AWQ scale, SmoothQuant | Q4 model-path green, tok/s ≥ 2× Phase 2 |
+| 4 (Spec decode) | T5 | Qwen3.5 native MTP heads, EAGLE-3 alternative | tok/s ≥ 1.5× Phase 3, acceptance > 0.6 |
+| 5 (MoE SSD) | T3 | 3-stage prefetch, router-first top-k, PagedAttention | 35B Q4 tok/s ≥ 2 |
+| 6 (Z3 Safety) | T6 | INV-10 to INV-15 with z3 crate | 6 UNSAT + negative tests |
+| 7 (Production) | T7 | Integration + 397B batched + v2.0 release | Reproducible v2.0 |
+
+### Honest performance trajectory (no claims, bandwidth math only)
+
+```
+Phase 0 (D0029 baseline):  0.50 tok/s on 8B, 0 tok/s on 35B/397B
+Phase 1 (T1 kernels):     0.50-0.65 tok/s on 8B (no regression gate)
+Phase 2 (+ CUDA Graphs):  0.55-0.90 tok/s on 8B (1.1-1.4× phase 1)
+Phase 3 (+ Q4_K_M):       2-6 tok/s on 8B Q4 (Q4 reduces memory 4×)
+Phase 4 (+ MTP):          3-12 tok/s on 8B Q4 MTP (1.5-2× phase 3)
+Phase 5 (+ SSD stream):   2-3 tok/s on 35B Q4 (NVMe bandwidth bound)
+Phase 6 (+ Z3):           same as phase 5 (orthogonal, no perf delta)
+Phase 7 (integrated):     397B batched: 0.5-1.5 tok/s; 8B: 5-10 tok/s
+```
+
+**No 500× claims.** Every phase uses bandwidth math. If a phase
+over-delivers, it's honest data. If it under-delivers, that's a
+D-entry to revise the plan.
+
+### Phase dependency graph
+
+```
+0 → 1 → 2 → 4 → 7
+0 → 1 → 3 → 4 → 7
+0 → 1 → 3 → 5 → 7
+0 → 6 → 7   (independent of inference work)
+```
+
+### Key decisions locked at v2.2
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Tensor backend | candle 0.11 + cudarc 0.19 | Working, all shims proven, v2.0+ fork OK |
+| Quantization | Q4_K_M (FFN) + FP16 (shared expert + attn output) + INT8 (QKV) | Memory budget vs quality |
+| MoE strategy | Router-first top-k SSD stream | Activates ~1-3 GB experts per forward |
+| Speculative | Native MTP (Qwen3.5 ships with it) | Lower complexity than EAGLE-3, 1.5-2× speedup |
+| Safety proof | Z3 (rust-z3 crate) | Production-grade SMT solver, <100ms cold per invariant |
+| Hardware target | RTX 2060 SUPER sm_75 | $400 budget, FP16 Tensor Cores only |
+
+### AUDIT.md entry reservation (D0031-D0050)
+
+20 entries reserved, one per phase + sub-phase. Pattern:
+- D0031-D0037: Phase 1 (6 kernels + model-path integration)
+- D0038-D0039: Phase 2 (CUDA Graphs)
+- D0040-D0042: Phase 3 (Quantization)
+- D0043-D0045: Phase 4 (Spec decode)
+- D0046-D0048: Phase 5 (MoE SSD)
+- D0049-D0050: Phase 6 (Z3 Safety)
+- D0051+: Phase 7 (Production)
+
+### Honest gaps from Perplexity source (not re-verified here)
+
+The Perplexity source has 8 self-acknowledged gaps in Appendix B:
+- LADE arxiv ID was wrong (correct is 2402.02057)
+- SpQR arxiv ID was wrong (correct is 2306.03078)
+- QuIP# arxiv ID was wrong (correct is 2402.04396)
+- AffineQuant arxiv ID not found
+- QuIP# INT2 on sm_75 silent failure unconfirmed
+- Qwen3.5-397B MTP head details unconfirmed (model not yet public as
+  of knowledge cutoff)
+- `enable_cuda_graph_htod_cache()` location unconfirmed
+- vLLM PR #21401 specific 2.5× speedup claim unconfirmed
+
+These are documented in the source for honesty. The phased plan
+proceeds without depending on these specific claims.
+
+### Source document
+
+The complete 2122-line Perplexity Deep Research output lives at
+`/home/thelinconx/Descargas/apohara-dekanus-v2.2.md`. The detailed
+code patterns, paper references, and honest gaps live there. This
+synthesized phased file is the executable version with phase gates.
+
+**No fabrication.** All phase projections are bandwidth math, not
+performance claims.
+
