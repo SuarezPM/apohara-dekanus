@@ -406,8 +406,13 @@ impl Qwen3StreamingModel {
             let v_h = crate::dispatch::narrow(v_cache, D::Minus2, kv_h, 1)?.squeeze(1)?; // [seq_len, head_dim]
             // scores [1, seq_len]
             let scores = q_h.matmul(&k_h.t()?)?.affine(scale, 0.0)?;
-            // softmax over seq_len dim
-            let weights = candle_nn::ops::softmax_last_dim(&scores)?;
+            // softmax over seq_len dim (manual: subtract max for numerical
+            // stability, exp, normalize — all ops have CUDA impls in candle 0.11).
+            let max_scores = scores.max_keepdim(candle_core::D::Minus1)?;
+            let shifted = scores.broadcast_sub(&max_scores)?;
+            let exp_scores = shifted.exp()?;
+            let sum_exp = exp_scores.sum_keepdim(candle_core::D::Minus1)?;
+            let weights = exp_scores.broadcast_div(&sum_exp)?;
             // context [1, head_dim]
             let ctx = weights.matmul(&v_h)?;
             attn_outs.push(ctx);
