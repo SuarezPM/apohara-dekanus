@@ -11,12 +11,12 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-/// Narrow (slice) launcher.
-///
-/// `in_strides` and `in_shape` are host-side arrays of length `n_dims`
-/// (row-major contiguous strides). The kernel does not need GPU
-/// device-side memory allocation; the host caller passes already-
-/// allocated device pointers.
+// Narrow (slice) launcher.
+//
+// `in_strides` and `in_shape` are host-side arrays of length `n_dims`
+// (row-major contiguous strides). The kernel does not need GPU
+// device-side memory allocation; the host caller passes already-
+// allocated device pointers.
 #[cfg(feature = "cuda")]
 extern "C" {
     pub fn narrow_f32(
@@ -32,11 +32,11 @@ extern "C" {
     );
 }
 
-/// Stack (concat along new dim) launcher.
-///
-/// `in_ptrs` is host-side array of N device pointers, one per input
-/// tensor. `out_strides` is the precomputed row-major strides of the
-/// output tensor (which has size 1 inserted at `dim`).
+// Stack (concat along new dim) launcher.
+//
+// `in_ptrs` is host-side array of N device pointers, one per input
+// tensor. `out_strides` is the precomputed row-major strides of the
+// output tensor (which has size 1 inserted at `dim`).
 #[cfg(feature = "cuda")]
 extern "C" {
     pub fn stack_f32(
@@ -51,7 +51,7 @@ extern "C" {
     );
 }
 
-/// Reshape (strided element copy) launcher.
+// Reshape (strided element copy) launcher.
 #[cfg(feature = "cuda")]
 extern "C" {
     pub fn reshape_f32(

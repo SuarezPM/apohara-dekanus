@@ -12,14 +12,12 @@
 
 pub mod ffi;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::{
     cuda_backend::{CudaStorage, CudaStorageSlice},
-    op::BackpropOp, DType, Shape, Storage, Tensor, WithDType,
+    op::BackpropOp, DType, Shape, Storage, Tensor,
 };
-use candle_core::cuda_backend::cudarc::driver::{
-    CudaSlice, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg,
-};
+use candle_core::cuda_backend::cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 /// Public API: narrow a tensor (CPU → candle built-in; CUDA → our custom kernel).
 pub fn narrow(
@@ -36,9 +34,13 @@ pub fn narrow(
 }
 
 fn narrow_cuda(t: &Tensor, dim: usize, start: usize, length: usize) -> Result<Tensor> {
+    // Dispatch to the right kernel based on input dtype.
+    if t.dtype() == DType::BF16 {
+        return narrow_bf16_cuda(t, dim, start, length);
+    }
     if t.dtype() != DType::F32 {
         return Err(anyhow::anyhow!(
-            "narrow_cuda: only F32 supported in this iteration (got {:?})",
+            "narrow_cuda: only F32/BF16 supported (got {:?})",
             t.dtype()
         ));
     }
@@ -82,7 +84,7 @@ fn narrow_cuda(t: &Tensor, dim: usize, start: usize, length: usize) -> Result<Te
         .map_err(|e| anyhow::anyhow!("htod strides: {}", e))?;
 
     // 4. Allocate output buffer on GPU
-    let mut out_dev: CudaSlice<f32> = unsafe { dev.alloc::<f32>(out_total) }
+    let out_dev: CudaSlice<f32> = unsafe { dev.alloc::<f32>(out_total) }
         .map_err(|e| anyhow::anyhow!("alloc out: {}", e))?;
 
     // 5. Load custom PTX kernel via candle's CudaDevice (the canonical path)
@@ -172,4 +174,95 @@ fn reshape_cuda(t: &Tensor, shape: &Shape) -> Result<Tensor> {
     // cut, delegate to it. A custom PTX kernel can replace this later if
     // profiling shows candle's reshape is slow.
     t.reshape(shape.clone()).map_err(anyhow::Error::from)
+}
+
+fn narrow_bf16_cuda(t: &Tensor, dim: usize, start: usize, length: usize) -> Result<Tensor> {
+    // 1. Access storage + layout from the candle Tensor
+    let (storage_guard, layout) = t.storage_and_layout();
+    let cuda_storage: &CudaStorage = match &*storage_guard {
+        Storage::Cuda(s) => s,
+        _ => return Err(anyhow::anyhow!("narrow_bf16_cuda: tensor is not on CUDA")),
+    };
+    let dev = cuda_storage.device.clone();
+    let slice: &cudarc::driver::CudaSlice<half::bf16> = cuda_storage
+        .as_cuda_slice::<half::bf16>()
+        .map_err(|e| anyhow::anyhow!("as_cuda_slice bf16: {}", e))?;
+
+    // 2. Compute output shape and strides
+    let dims: Vec<usize> = layout.shape().dims().to_vec();
+    let strides: Vec<usize> = layout.stride().to_vec();
+    let n_dims = dims.len();
+    if dim >= n_dims {
+        return Err(anyhow::anyhow!("narrow_bf16: dim {} out of range (rank {})", dim, n_dims));
+    }
+    let out_dims: Vec<usize> = dims
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| if i == dim { length } else { d })
+        .collect();
+    let out_total: usize = out_dims.iter().product();
+    if out_total == 0 {
+        return Err(anyhow::anyhow!("narrow_bf16: output is empty (out_dims={:?})", out_dims));
+    }
+
+    // 3. Upload shape + strides arrays to device
+    let dims_i64: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
+    let strides_i64: Vec<i64> = strides.iter().map(|&s| s as i64).collect();
+    let shape_dev: cudarc::driver::CudaSlice<i64> = dev
+        .clone_htod(dims_i64.as_slice())
+        .map_err(|e| anyhow::anyhow!("htod shape: {}", e))?;
+    let strides_dev: cudarc::driver::CudaSlice<i64> = dev
+        .clone_htod(strides_i64.as_slice())
+        .map_err(|e| anyhow::anyhow!("htod strides: {}", e))?;
+
+    // 4. Allocate output buffer on GPU
+    let out_dev: cudarc::driver::CudaSlice<half::bf16> = unsafe { dev.alloc::<half::bf16>(out_total) }
+        .map_err(|e| anyhow::anyhow!("alloc out bf16: {}", e))?;
+
+    // 5. Load custom PTX kernel
+    let ptx_src = include_str!("../kernels/narrow_bf16.cu.ptx");
+    let func = dev
+        .get_or_load_custom_func("narrow_bf16", "narrow_bf16_kernel", ptx_src)
+        .map_err(|e| anyhow::anyhow!("get_or_load_custom_func bf16: {}", e))?;
+
+    // 6. Launch kernel
+    let n_threads = 256u32;
+    let n_blocks = (out_total as u32).div_ceil(n_threads).max(1);
+    let cfg = LaunchConfig {
+        grid_dim: (n_blocks, 1, 1),
+        block_dim: (n_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(slice);
+    builder.arg(&out_dev);
+    builder.arg(&shape_dev);
+    builder.arg(&strides_dev);
+    let n_dims_i32 = n_dims as i32;
+    let dim_i32 = dim as i32;
+    let start_i64 = start as i64;
+    let length_i64 = length as i64;
+    let out_total_i64 = out_total as i64;
+    builder.arg(&n_dims_i32);
+    builder.arg(&dim_i32);
+    builder.arg(&start_i64);
+    builder.arg(&length_i64);
+    builder.arg(&out_total_i64);
+    unsafe {
+        builder
+            .launch(cfg)
+            .map_err(|e| anyhow::anyhow!("launch bf16: {}", e))?;
+    }
+
+    // 7. Wrap output into a fresh candle Tensor
+    Ok(Tensor::from_storage(
+        Storage::Cuda(CudaStorage {
+            slice: CudaStorageSlice::BF16(out_dev),
+            device: dev,
+        }),
+        Shape::from(out_dims),
+        BackpropOp::none(),
+        false,
+    ))
 }

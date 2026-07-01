@@ -22,6 +22,7 @@ cuda = []
 candle-core = { workspace = true }
 cudarc = { workspace = true, features = ["cuda-12050"] }
 anyhow = { workspace = true }
+half = "2"
 
 [build-dependencies]
 cudaforge = "0.1.2"

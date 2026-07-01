@@ -29,7 +29,13 @@ extern "C" __global__ void narrow_f32(
     long in_pos = 0;
     long temp = out_idx;
     for (int d = 0; d < n_dims; d++) {
-        long dim_size = in_shape[d];
+        // dim_size for coord computation is the OUTPUT size: in_shape[d]
+        // except at d == dim, where it is `length`. The previous version
+        // used in_shape[d] unconditionally, which over-counted coords
+        // and produced out-of-bounds reads. Same bug as the BF16 kernel
+        // (D0026): caught by gpu_narrow_bf16_roundtrip test and applied
+        // here for consistency.
+        long dim_size = (d == dim) ? length : in_shape[d];
         long coord = temp % dim_size;
         temp /= dim_size;
         if (d == dim) coord += start;

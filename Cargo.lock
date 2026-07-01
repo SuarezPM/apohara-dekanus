@@ -64,6 +64,7 @@ dependencies = [
  "candle-core",
  "cudaforge",
  "cudarc 0.19.8",
+ "half",
 ]
 
 [[package]]
