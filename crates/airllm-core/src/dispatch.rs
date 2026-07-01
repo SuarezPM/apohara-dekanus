@@ -146,21 +146,13 @@ pub fn reshape(t: &Tensor, shape: &[usize]) -> Result<Tensor> {
 
 /// Element-wise add. CPU: passthrough to `+`. CUDA: dispatches to the
 /// dtype-matching kernel in airllm-kernels. BF16 path uses the custom
-/// `add_bf16` kernel (D0028, item 1 of perf roadmap) — no F32 dance.
+/// `add_bf16` kernel (D0029, item 1 of perf roadmap) — no F32 dance.
+/// The start_offset fix (D0029 debug) makes the kernel work in the model
+/// path by slicing the device buffer at layout.start_offset() before
+/// passing to the kernel.
 pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if a.device().is_cuda() {
-        // TEMP: use the F32 dance until the BF16 add kernel is verified in
-        // the model path (the kernel works in isolation but produces
-        // degenerate output in the model — needs further investigation).
-        let target_dtype = a.dtype();
-        let a_f32 = a.to_dtype(DType::F32).map_err(|e| anyhow::anyhow!("a→F32: {}", e))?;
-        let b_f32 = b.to_dtype(DType::F32).map_err(|e| anyhow::anyhow!("b→F32: {}", e))?;
-        let out_f32 = (&a_f32 + &b_f32).map_err(|e| anyhow::anyhow!("add (F32): {}", e))?;
-        if target_dtype == DType::BF16 {
-            out_f32.to_dtype(DType::BF16).map_err(|e| anyhow::anyhow!("F32→BF16: {}", e))
-        } else {
-            Ok(out_f32)
-        }
+        airllm_kernels::add(a, b).map_err(|e| anyhow::anyhow!("airllm-kernels::add: {}", e))
     } else {
         Ok((a + b)?)
     }

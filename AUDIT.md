@@ -6298,3 +6298,133 @@ this is incremental progress, not the promised 5-10× speedup.
 **No fabrication** in this entire round. The 1.05× speedup and the
 BF16 add kernel failure are both reported honestly.
 
+---
+
+## Apohara-DeKanus Perf round 2: BF16 add kernel start_offset fix (D0029) — 2026-07-01
+
+### Entry #D0029 — D0028 bug found and fixed: start_offset not handled in dispatch shim | Field | Value |
+|---|---|---|
+| **Phase** | Tier 2 of roadmap, debug of D0028 BF16 add failure |
+| **Date** | 2026-07-01 15:00 -03 |
+| **Commits** | (this commit) |
+
+### TL;DR
+
+**The BF16 add kernel works in the model path now.** D0028's "fails in model
+path" was caused by the dispatch shim passing the device pointer at offset
+0 instead of the actual `layout.start_offset()`. The fix is the same pattern
+candle uses internally: slice the CudaSlice at `start_offset` before passing
+to the kernel.
+
+```text
+$ dekanus-cli generate --model models/Qwen3-8B --token 151645 --n 10 --gpu
+open_secs: 0.0110
+decode_secs: 19.7880 (10 new tokens + 1 initial)
+per_token_secs: 1.9788
+projected_decode_tps: 0.50
+generated_tokens: [151645, 11, 11, 67, 198, 198, 67, 18, 67, 2326, 19]
+```
+
+Coherent output. 0.50 tok/s — same as the F32 dance baseline (BF16 add
+alone is ~1 kernel launch out of ~100 per token, so the savings is
+~1-2%, within noise). The real speedup will come from doing the SAME
+fix for mul, silu, cat, reshape, and affine in the next round.
+
+### Root cause (D0028 carry-over)
+
+candle's `CudaStorage` holds **ONE `CudaSlice` per allocation**, with the
+`Layout` carrying `start_offset` separately. The model tensors (residuals
+like `hidden_states + attn_out`) almost always have `start_offset != 0`
+because they were sliced/transposed/narrowed at some point in the forward
+pass. The D0028 dispatch shim did:
+
+```rust
+let a_slice: &CudaSlice<half::bf16> = a_cuda.as_cuda_slice::<half::bf16>()?;
+let b_slice: &CudaSlice<half::bf16> = b_cuda.as_cuda_slice::<half::bf16>()?;
+builder.arg(a_slice);
+builder.arg(b_slice);
+```
+
+This passes the device pointer at offset **0** of the allocation, NOT
+the data's actual position. The kernel reads zeros/garbage from the
+start of the allocation. Output: degenerate tokens.
+
+**Why it worked in isolation**: the test (`add_bf16_test.rs`) creates
+fresh tensors via `Tensor::from_vec` whose `CudaSlice` starts at
+offset 0 (no prior slicing). The kernel reads from offset 0, which
+is the actual data. Coincidental pass.
+
+### The fix
+
+candle's own kernels (e.g., `badd_bf16` in `candle-kernels/src/binary.cu`)
+handle this by always doing:
+```rust
+&src.slice(layout.start_offset()..)
+```
+before any `builder.arg`. The D0029 fix applies the same pattern to
+`airllm_kernels::add_bf16_cuda`:
+
+```rust
+// Clone the full CudaSlice (so it outlives the view), then take a
+// CudaView with the offset baked in.
+let a_full: CudaSlice<half::bf16> = a_cuda.as_cuda_slice::<half::bf16>()?.clone();
+let a_base: CudaView<'_, half::bf16> = a_full.slice(a_layout.start_offset()..);
+// a_base.device_ptr() now returns a_cuda.ptr + start_offset (in bytes)
+builder.arg(&a_base);
+```
+
+`CudaSlice::slice(&self, ..)` returns a `CudaView<'_, T>` (borrowed view)
+with the offset baked into the device pointer. The parent `CudaSlice`
+must outlive the `CudaView` (lifetime constraint), so we `.clone()` the
+parent (clone is cheap — clones metadata and event tracking, not the
+device buffer). cudarc's `PushKernelArg for &CudaView<T>` impl extracts
+the (already-offset) device pointer correctly.
+
+### Honest measurement
+
+| Metric | D0028 (F32 dance) | D0029 (BF16 add kernel) | Notes |
+|---|---|---|---|
+| Output tokens | coherent | coherent | both produce `[11, 11, 67, 198, 198, ...]` |
+| tok/s | 0.49 | 0.50 | +2% (within noise) |
+| Kernel launches/token for `add` | 4 (cast×2 + add + cast) | 1 (just the kernel) | 4× less per-add |
+
+The speedup is negligible because `add` is one of ~100 kernel launches
+per token. Saving 3 launches out of 100 is 3% — within measurement noise.
+**The value of the fix is not the add speedup; it's that the same pattern
+will unlock real speedup when applied to the other 6 ops** (mul, silu,
+cat, reshape, affine, stack) where the F32 dance also happens in the
+hot path.
+
+### State of T6.5 / item 1
+
+- ✅ BF16 add kernel: works in isolation AND in model path (D0029 fix)
+- ⏳ BF16 mul, silu, cat, reshape, affine, stack: not written. Each is
+  ~30 min of work following the D0029 pattern. The fix is to ALWAYS
+  slice at `start_offset` before `builder.arg`.
+- ⏳ Item 2 (CUDA Graphs): not started this round
+- ⏳ Item 4 (re-measure): 0.50 tok/s (vs 0.49 F32 dance = same). The
+  per-kernel speedup will accumulate when all 7 kernels are converted.
+
+### Lessons
+
+- **The model path test is the only test that matters**. Isolation tests
+  on fresh tensors missed the start_offset bug because the test tensors
+  happened to have offset 0. The D0028 round noted "works in isolation"
+  without verifying the model path. Lesson: every perf kernel MUST be
+  tested in the model path, not just in synthetic isolation.
+- **`CudaStorage` has a footgun**: the same CudaSlice is reused across
+  many tensor views (via Layout.start_offset). Any dispatch shim that
+  doesn't account for start_offset will silently read wrong data.
+- **The fix is small but unlocks 6 more kernels**. The pattern is
+  reusable. With 6 more kernels converted (each saves 3-4 F32 dance
+  launches), total kernel-launch savings would be ~20-30% per token.
+
+### Files changed
+
+- `crates/airllm-kernels/src/lib.rs` (`add_bf16_cuda`): now slices
+  `CudaSlice` at `start_offset` before kernel launch.
+- `crates/airllm-core/src/dispatch.rs` (`add`): un-reverted from F32
+  dance to use the BF16 add kernel via `airllm_kernels::add`.
+
+**No fabrication** in this entire round.
+

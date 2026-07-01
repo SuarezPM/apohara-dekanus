@@ -284,14 +284,17 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 }
 
 fn add_bf16_cuda(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    // Contiguous-ify first: model tensors may be non-contiguous (e.g., the
-    // output of a broadcast or a slice). The kernel assumes contiguous
-    // same-shape inputs. If they are not contiguous, .contiguous() makes
-    // a contiguous copy; if they already are, it's a no-op view.
-    let a_c = a.contiguous().map_err(|e| anyhow::anyhow!("a.contiguous: {}", e))?;
-    let b_c = b.contiguous().map_err(|e| anyhow::anyhow!("b.contiguous: {}", e))?;
-    let (a_storage, a_layout) = a_c.storage_and_layout();
-    let (b_storage, b_layout) = b_c.storage_and_layout();
+    // candle's CudaStorage holds ONE CudaSlice per allocation, with the
+    // Layout carrying start_offset separately. The model tensors (residuals
+    // like hidden_states + attn_out) often have start_offset != 0 because
+    // they came from narrow/slice/transpose+contiguous. We MUST slice the
+    // device buffer at start_offset BEFORE passing to the kernel — otherwise
+    // the kernel reads from offset 0 of the allocation, not from where the
+    // data actually lives. This is the root cause of the model-path failure
+    // documented in D0028. (Tested: in isolation start_offset == 0, hence
+    // the kernel "works".)
+    let (a_storage, a_layout) = a.storage_and_layout();
+    let (b_storage, b_layout) = b.storage_and_layout();
     let a_cuda: &CudaStorage = match &*a_storage {
         Storage::Cuda(s) => s,
         _ => return Err(anyhow::anyhow!("add_bf16_cuda: a is not on CUDA")),
@@ -308,12 +311,20 @@ fn add_bf16_cuda(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         ));
     }
     let dev = a_cuda.device.clone();
-    let a_slice: &cudarc::driver::CudaSlice<half::bf16> = a_cuda
+    // Slice the CudaSlice at start_offset. cudarc's CudaSlice::slice(&self, ..)
+    // returns a CudaView<'_, T> (borrowed view) with the offset baked in.
+    // The parent CudaSlice must outlive the CudaView (lifetime constraint).
+    // The view's device pointer is `parent.ptr + offset_in_bytes`.
+    let a_full: cudarc::driver::CudaSlice<half::bf16> = a_cuda
         .as_cuda_slice::<half::bf16>()
-        .map_err(|e| anyhow::anyhow!("as_cuda_slice a: {}", e))?;
-    let b_slice: &cudarc::driver::CudaSlice<half::bf16> = b_cuda
+        .map_err(|e| anyhow::anyhow!("as_cuda_slice a: {}", e))?
+        .clone();
+    let b_full: cudarc::driver::CudaSlice<half::bf16> = b_cuda
         .as_cuda_slice::<half::bf16>()
-        .map_err(|e| anyhow::anyhow!("as_cuda_slice b: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("as_cuda_slice b: {}", e))?
+        .clone();
+    let a_base: cudarc::driver::CudaView<'_, half::bf16> = a_full.slice(a_layout.start_offset()..);
+    let b_base: cudarc::driver::CudaView<'_, half::bf16> = b_full.slice(b_layout.start_offset()..);
 
     let total: usize = a_layout.shape().elem_count();
     if total == 0 {
@@ -336,11 +347,14 @@ fn add_bf16_cuda(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         shared_mem_bytes: 0,
     };
 
-    // Pass slices directly (cudarc uses DeviceRepr to get the device pointer
-    // for the kernel argument). Same pattern as narrow_bf16_cuda.
+    // Now a_base/b_base are owned CudaSlice<bf16> with start_offset already
+    // baked into the device pointer. Pass them to builder.arg — cudarc's
+    // PushKernelArg for &CudaSlice<T> extracts the (already-offset) device
+    // pointer. The owned values a_base and b_base stay alive for the
+    // duration of the launch.
     let mut builder = func.builder();
-    builder.arg(a_slice);
-    builder.arg(b_slice);
+    builder.arg(&a_base);
+    builder.arg(&b_base);
     builder.arg(&out_dev);
     let total_i64 = total as i64;
     builder.arg(&total_i64);
