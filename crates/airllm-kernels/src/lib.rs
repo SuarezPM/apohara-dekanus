@@ -283,6 +283,21 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     }
 }
 
+/// Public API: element-wise multiply. CPU: passthrough to `*`. CUDA:
+/// dispatches to the dtype-matching kernel in airllm-kernels. BF16 path
+/// uses the custom `mul_bf16` kernel — no F32 dance.
+pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if a.device().is_cuda() {
+        match a.dtype() {
+            DType::BF16 => mul_bf16_cuda(a, b),
+            DType::F32 => Ok((a * b)?),
+            other => Err(anyhow::anyhow!("mul: only F32/BF16 supported, got {:?}", other)),
+        }
+    } else {
+        Ok((a * b)?)
+    }
+}
+
 fn add_bf16_cuda(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     // candle's CudaStorage holds ONE CudaSlice per allocation, with the
     // Layout carrying start_offset separately. The model tensors (residuals
@@ -362,6 +377,80 @@ fn add_bf16_cuda(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         builder
             .launch(cfg)
             .map_err(|e| anyhow::anyhow!("launch add_bf16: {}", e))?;
+    }
+
+    Ok(Tensor::from_storage(
+        Storage::Cuda(CudaStorage {
+            slice: CudaStorageSlice::BF16(out_dev),
+            device: dev,
+        }),
+        a_layout.shape().clone(),
+        BackpropOp::none(),
+        false,
+    ))
+}
+
+fn mul_bf16_cuda(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let (a_storage, a_layout) = a.storage_and_layout();
+    let (b_storage, b_layout) = b.storage_and_layout();
+    let a_cuda: &CudaStorage = match &*a_storage {
+        Storage::Cuda(s) => s,
+        _ => return Err(anyhow::anyhow!("mul_bf16_cuda: a is not on CUDA")),
+    };
+    let b_cuda: &CudaStorage = match &*b_storage {
+        Storage::Cuda(s) => s,
+        _ => return Err(anyhow::anyhow!("mul_bf16_cuda: b is not on CUDA")),
+    };
+    if a_layout.shape() != b_layout.shape() {
+        return Err(anyhow::anyhow!(
+            "mul_bf16_cuda: shape mismatch {:?} vs {:?}",
+            a_layout.shape(),
+            b_layout.shape()
+        ));
+    }
+    let dev = a_cuda.device.clone();
+    let a_full: cudarc::driver::CudaSlice<half::bf16> = a_cuda
+        .as_cuda_slice::<half::bf16>()
+        .map_err(|e| anyhow::anyhow!("as_cuda_slice a: {}", e))?
+        .clone();
+    let b_full: cudarc::driver::CudaSlice<half::bf16> = b_cuda
+        .as_cuda_slice::<half::bf16>()
+        .map_err(|e| anyhow::anyhow!("as_cuda_slice b: {}", e))?
+        .clone();
+    let a_base: cudarc::driver::CudaView<'_, half::bf16> = a_full.slice(a_layout.start_offset()..);
+    let b_base: cudarc::driver::CudaView<'_, half::bf16> = b_full.slice(b_layout.start_offset()..);
+
+    let total: usize = a_layout.shape().elem_count();
+    if total == 0 {
+        return Err(anyhow::anyhow!("mul_bf16_cuda: empty tensors"));
+    }
+
+    let out_dev: cudarc::driver::CudaSlice<half::bf16> = unsafe { dev.alloc::<half::bf16>(total) }
+        .map_err(|e| anyhow::anyhow!("alloc out: {}", e))?;
+
+    let ptx_src = include_str!("../kernels/mul_bf16.cu.ptx");
+    let func = dev
+        .get_or_load_custom_func("mul_bf16", "mul_bf16_kernel", ptx_src)
+        .map_err(|e| anyhow::anyhow!("get_or_load_custom_func mul_bf16: {}", e))?;
+
+    let n_threads = 256u32;
+    let n_blocks = (total as u32).div_ceil(n_threads).max(1);
+    let cfg = LaunchConfig {
+        grid_dim: (n_blocks, 1, 1),
+        block_dim: (n_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(&a_base);
+    builder.arg(&b_base);
+    builder.arg(&out_dev);
+    let total_i64 = total as i64;
+    builder.arg(&total_i64);
+    unsafe {
+        builder
+            .launch(cfg)
+            .map_err(|e| anyhow::anyhow!("launch mul_bf16: {}", e))?;
     }
 
     Ok(Tensor::from_storage(

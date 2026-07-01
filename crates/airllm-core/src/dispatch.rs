@@ -158,18 +158,12 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     }
 }
 
-/// Element-wise mul with F32 dance on CUDA. Same rationale as `add`.
+/// Element-wise mul. CPU: passthrough to `*`. CUDA: dispatches to the
+/// dtype-matching kernel in airllm-kernels. BF16 path uses the custom
+/// `mul_bf16` kernel — no F32 dance.
 pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if a.device().is_cuda() {
-        let target_dtype = a.dtype();
-        let a_f32 = a.to_dtype(DType::F32).map_err(|e| anyhow::anyhow!("a→F32: {}", e))?;
-        let b_f32 = b.to_dtype(DType::F32).map_err(|e| anyhow::anyhow!("b→F32: {}", e))?;
-        let out_f32 = (&a_f32 * &b_f32).map_err(|e| anyhow::anyhow!("mul (F32): {}", e))?;
-        if target_dtype == DType::BF16 {
-            out_f32.to_dtype(DType::BF16).map_err(|e| anyhow::anyhow!("F32→BF16: {}", e))
-        } else {
-            Ok(out_f32)
-        }
+        airllm_kernels::mul(a, b).map_err(|e| anyhow::anyhow!("airllm-kernels::mul: {}", e))
     } else {
         Ok((a * b)?)
     }

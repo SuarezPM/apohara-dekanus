@@ -11,8 +11,6 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-use half::bf16;
-
 // Narrow (slice) launcher.
 //
 // `in_strides` and `in_shape` are host-side arrays of length `n_dims`
@@ -73,6 +71,18 @@ extern "C" {
 #[cfg(feature = "cuda")]
 extern "C" {
     pub fn add_bf16(
+        a_ptr: *const half::bf16,
+        b_ptr: *const half::bf16,
+        out_ptr: *mut half::bf16,
+        total: i64,
+    );
+}
+
+// BF16 multiply launcher. Same contract as add_bf16: contiguous
+// same-shape input and output, total element count.
+#[cfg(feature = "cuda")]
+extern "C" {
+    pub fn mul_bf16(
         a_ptr: *const half::bf16,
         b_ptr: *const half::bf16,
         out_ptr: *mut half::bf16,
