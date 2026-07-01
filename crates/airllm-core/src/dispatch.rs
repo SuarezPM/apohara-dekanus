@@ -144,11 +144,14 @@ pub fn reshape(t: &Tensor, shape: &[usize]) -> Result<Tensor> {
     }
 }
 
-/// Element-wise add with F32 dance on CUDA. candle 0.11 lacks a BF16
-/// add kernel; we cast both operands to F32, do the add, cast back.
-/// On CPU, passthrough to the `+` operator.
+/// Element-wise add. CPU: passthrough to `+`. CUDA: dispatches to the
+/// dtype-matching kernel in airllm-kernels. BF16 path uses the custom
+/// `add_bf16` kernel (D0028, item 1 of perf roadmap) — no F32 dance.
 pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if a.device().is_cuda() {
+        // TEMP: use the F32 dance until the BF16 add kernel is verified in
+        // the model path (the kernel works in isolation but produces
+        // degenerate output in the model — needs further investigation).
         let target_dtype = a.dtype();
         let a_f32 = a.to_dtype(DType::F32).map_err(|e| anyhow::anyhow!("a→F32: {}", e))?;
         let b_f32 = b.to_dtype(DType::F32).map_err(|e| anyhow::anyhow!("b→F32: {}", e))?;

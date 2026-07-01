@@ -411,42 +411,72 @@ impl Qwen3StreamingModel {
         let v_cache = &kv_cache.values[layer_idx];
 
         // Real SDPA: q [1, num_heads, head_dim] x k_cache^T [num_kv_heads, head_dim, seq_len]
-        // Per GQA: q_head i uses k_cache[kv_head=i//4]
-        // attn_score[q_h, k_pos] = (q[0, q_h] · k_cache[k_pos, q_h//4]) / sqrt(head_dim)
+        // Per GQA: q_head i uses k_cache[kv_head=i//group_size].
+        // Batched implementation: single matmul instead of num_heads separate matmuls.
+        // This eliminates the per-head loop and the per-head narrow+cat (item 3 of
+        // the perf roadmap). Combined with F32 dance for the softmax body
+        // (broadcast_sub/div/affine lack BF16 CUDA kernels in candle 0.11).
         let scale = 1.0 / (head_dim as f64).sqrt();
-        // Per-head loop (honest PoC, clearer than broadcast gymnastics)
-        let mut attn_outs = Vec::with_capacity(num_heads);
-        for h in 0..num_heads {
-            let kv_h = h / (num_heads / num_kv_heads);
-            let q_h = crate::dispatch::narrow(&q, D::Minus2, h, 1)?.squeeze(1)?; // [1, head_dim]
-            let k_h = crate::dispatch::narrow(k_cache, D::Minus2, kv_h, 1)?.squeeze(1)?; // [seq_len, head_dim]
-            let v_h = crate::dispatch::narrow(v_cache, D::Minus2, kv_h, 1)?.squeeze(1)?; // [seq_len, head_dim]
-            // F32 dance for the attention body: candle 0.11's CUDA backend
-            // lacks kernels for BF16 affine / broadcast_sub / broadcast_div.
-            // Cast q/k/v to F32, do the body, cast ctx back to original dtype.
-            // This is a known T11-blocker documented in D0015/D0025.
-            let q_h_f32 = q_h.to_dtype(DType::F32)?;
-            let k_h_f32 = k_h.to_dtype(DType::F32)?;
-            let v_h_f32 = v_h.to_dtype(DType::F32)?;
-            // scores [1, seq_len]
-            let scores = q_h_f32.matmul(&k_h_f32.t()?)?.affine(scale, 0.0)?;
-            // softmax over seq_len dim (subtract max for numerical stability,
-            // exp, normalize — F32 ops have CUDA impls in candle 0.11).
-            let max_scores = scores.max_keepdim(candle_core::D::Minus1)?;
-            let shifted = scores.broadcast_sub(&max_scores)?;
-            let exp_scores = shifted.exp()?;
-            let sum_exp = exp_scores.sum_keepdim(candle_core::D::Minus1)?;
-            let weights = exp_scores.broadcast_div(&sum_exp)?;
-            // context [1, head_dim]
-            let ctx = weights.matmul(&v_h_f32)?;
-            let ctx_back = if q.dtype() == DType::BF16 { ctx.to_dtype(DType::BF16)? } else { ctx };
-            attn_outs.push(ctx_back);
-        }
-        // Concat all heads back to [1, num_heads * head_dim]
-        let attn_concat = crate::dispatch::cat(
-            &attn_outs.iter().collect::<Vec<_>>(),
-            1,
-        )?;
+        let group_size = num_heads / num_kv_heads;
+        let seq_len = k_cache.dim(0)?;
+
+        // F32 dance: cast q/k_cache/v_cache once for the whole batched body.
+        let q_f32 = q.to_dtype(DType::F32)?;
+        let k_cache_f32 = k_cache.to_dtype(DType::F32)?;
+        let v_cache_f32 = v_cache.to_dtype(DType::F32)?;
+
+        // GQA expand: [seq_len, num_kv_heads, head_dim] -> [seq_len, num_heads, head_dim]
+        // by inserting a size-1 axis and broadcasting to group_size, then flattening.
+        let k_expanded = k_cache_f32
+            .reshape((seq_len, num_kv_heads, 1, head_dim))?
+            .broadcast_as((seq_len, num_kv_heads, group_size, head_dim))?
+            .reshape((seq_len, num_heads, head_dim))?;
+        let v_expanded = v_cache_f32
+            .reshape((seq_len, num_kv_heads, 1, head_dim))?
+            .broadcast_as((seq_len, num_kv_heads, group_size, head_dim))?
+            .reshape((seq_len, num_heads, head_dim))?;
+
+        // Batched Q @ K^T.
+        // q: [1, num_heads, head_dim] -> transpose -> [num_heads, 1, head_dim]
+        // k: [seq_len, num_heads, head_dim] -> transpose(0,2).transpose(0,1)
+        //    -> [head_dim, num_heads, seq_len] -> [num_heads, head_dim, seq_len]
+        // matmul: [num_heads, 1, head_dim] @ [num_heads, head_dim, seq_len]
+        //       = [num_heads, 1, seq_len]
+        // contiguous() required: candle matmul needs contiguous tensors.
+        let q_t = q_f32.transpose(0, 1)?.contiguous()?;
+        let k_t = k_expanded.transpose(0, 2)?.transpose(0, 1)?.contiguous()?;
+        let scores_3d = q_t.matmul(&k_t)?.affine(scale, 0.0)?;
+        // scores_3d: [num_heads, 1, seq_len] -> [1, num_heads, seq_len]
+        let scores = scores_3d.transpose(0, 1)?.squeeze(1)?;
+
+        // Softmax over seq_len (last dim).
+        let max_scores = scores.max_keepdim(candle_core::D::Minus1)?;
+        let shifted = scores.broadcast_sub(&max_scores)?;
+        let exp_scores = shifted.exp()?;
+        let sum_exp = exp_scores.sum_keepdim(candle_core::D::Minus1)?;
+        let weights = exp_scores.broadcast_div(&sum_exp)?; // [1, num_heads, seq_len]
+
+        // Batched weights @ V.
+        // weights: [1, num_heads, seq_len] -> [num_heads, 1, seq_len]
+        // v: [seq_len, num_heads, head_dim] -> [num_heads, seq_len, head_dim]
+        // matmul: [num_heads, 1, seq_len] @ [num_heads, seq_len, head_dim]
+        //       = [num_heads, 1, head_dim]
+        let weights_t = weights.transpose(0, 1)?.contiguous()?;
+        let v_t = v_expanded.transpose(0, 1)?.contiguous()?;
+        let ctx_3d = weights_t.matmul(&v_t)?;
+        // ctx_3d: [num_heads, 1, head_dim] -> [1, num_heads, head_dim]
+        let ctx_f32 = ctx_3d.transpose(0, 1)?.squeeze(1)?;
+
+        // Cast back to original dtype if needed.
+        let ctx = if q.dtype() == DType::BF16 {
+            ctx_f32.to_dtype(DType::BF16)?
+        } else {
+            ctx_f32
+        };
+
+        // Heads are already concatenated along the head dim (no per-head cat needed).
+        // Reshape to [1, num_heads * head_dim] for the O projection.
+        let attn_concat = crate::dispatch::reshape(&ctx, &[1, num_heads * head_dim])?;
 
         // O projection
         let o_w = self.builder.get_tensor(&o_name)?;

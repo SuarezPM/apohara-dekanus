@@ -11,6 +11,8 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
+use half::bf16;
+
 // Narrow (slice) launcher.
 //
 // `in_strides` and `in_shape` are host-side arrays of length `n_dims`
@@ -61,5 +63,19 @@ extern "C" {
         out_strides_ptr: *const i64,
         n_dims: i32,
         out_total: i64,
+    );
+}
+
+// BF16 add launcher (item 1 of perf roadmap: eliminate F32 dance).
+// Item count: total elements in the contiguous tensors. Caller is
+// responsible for same-shape input and output (the dispatch shim routes
+// residuals through this kernel, which are always same-shape).
+#[cfg(feature = "cuda")]
+extern "C" {
+    pub fn add_bf16(
+        a_ptr: *const half::bf16,
+        b_ptr: *const half::bf16,
+        out_ptr: *mut half::bf16,
+        total: i64,
     );
 }

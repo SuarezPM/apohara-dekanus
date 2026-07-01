@@ -266,3 +266,97 @@ fn narrow_bf16_cuda(t: &Tensor, dim: usize, start: usize, length: usize) -> Resu
         false,
     ))
 }
+
+/// Public API: element-wise add (CPU → candle built-in; CUDA → our custom kernel).
+/// Used for residuals in the model forward (e.g., `hidden_states + attn_out`).
+/// Currently only the BF16 path is implemented (item 1 of perf roadmap).
+/// F32 path delegates to candle's built-in.
+pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if a.device().is_cuda() {
+        match a.dtype() {
+            DType::BF16 => add_bf16_cuda(a, b),
+            DType::F32 => Ok((a + b)?),
+            other => Err(anyhow::anyhow!("add: only F32/BF16 supported, got {:?}", other)),
+        }
+    } else {
+        Ok((a + b)?)
+    }
+}
+
+fn add_bf16_cuda(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    // Contiguous-ify first: model tensors may be non-contiguous (e.g., the
+    // output of a broadcast or a slice). The kernel assumes contiguous
+    // same-shape inputs. If they are not contiguous, .contiguous() makes
+    // a contiguous copy; if they already are, it's a no-op view.
+    let a_c = a.contiguous().map_err(|e| anyhow::anyhow!("a.contiguous: {}", e))?;
+    let b_c = b.contiguous().map_err(|e| anyhow::anyhow!("b.contiguous: {}", e))?;
+    let (a_storage, a_layout) = a_c.storage_and_layout();
+    let (b_storage, b_layout) = b_c.storage_and_layout();
+    let a_cuda: &CudaStorage = match &*a_storage {
+        Storage::Cuda(s) => s,
+        _ => return Err(anyhow::anyhow!("add_bf16_cuda: a is not on CUDA")),
+    };
+    let b_cuda: &CudaStorage = match &*b_storage {
+        Storage::Cuda(s) => s,
+        _ => return Err(anyhow::anyhow!("add_bf16_cuda: b is not on CUDA")),
+    };
+    if a_layout.shape() != b_layout.shape() {
+        return Err(anyhow::anyhow!(
+            "add_bf16_cuda: shape mismatch {:?} vs {:?}",
+            a_layout.shape(),
+            b_layout.shape()
+        ));
+    }
+    let dev = a_cuda.device.clone();
+    let a_slice: &cudarc::driver::CudaSlice<half::bf16> = a_cuda
+        .as_cuda_slice::<half::bf16>()
+        .map_err(|e| anyhow::anyhow!("as_cuda_slice a: {}", e))?;
+    let b_slice: &cudarc::driver::CudaSlice<half::bf16> = b_cuda
+        .as_cuda_slice::<half::bf16>()
+        .map_err(|e| anyhow::anyhow!("as_cuda_slice b: {}", e))?;
+
+    let total: usize = a_layout.shape().elem_count();
+    if total == 0 {
+        return Err(anyhow::anyhow!("add_bf16_cuda: empty tensors"));
+    }
+
+    let out_dev: cudarc::driver::CudaSlice<half::bf16> = unsafe { dev.alloc::<half::bf16>(total) }
+        .map_err(|e| anyhow::anyhow!("alloc out: {}", e))?;
+
+    let ptx_src = include_str!("../kernels/add_bf16.cu.ptx");
+    let func = dev
+        .get_or_load_custom_func("add_bf16", "add_bf16_kernel", ptx_src)
+        .map_err(|e| anyhow::anyhow!("get_or_load_custom_func add_bf16: {}", e))?;
+
+    let n_threads = 256u32;
+    let n_blocks = (total as u32).div_ceil(n_threads).max(1);
+    let cfg = LaunchConfig {
+        grid_dim: (n_blocks, 1, 1),
+        block_dim: (n_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // Pass slices directly (cudarc uses DeviceRepr to get the device pointer
+    // for the kernel argument). Same pattern as narrow_bf16_cuda.
+    let mut builder = func.builder();
+    builder.arg(a_slice);
+    builder.arg(b_slice);
+    builder.arg(&out_dev);
+    let total_i64 = total as i64;
+    builder.arg(&total_i64);
+    unsafe {
+        builder
+            .launch(cfg)
+            .map_err(|e| anyhow::anyhow!("launch add_bf16: {}", e))?;
+    }
+
+    Ok(Tensor::from_storage(
+        Storage::Cuda(CudaStorage {
+            slice: CudaStorageSlice::BF16(out_dev),
+            device: dev,
+        }),
+        a_layout.shape().clone(),
+        BackpropOp::none(),
+        false,
+    ))
+}
