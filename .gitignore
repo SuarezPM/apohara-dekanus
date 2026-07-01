@@ -37,3 +37,8 @@ Thumbs.db
 # Local benchmark artifacts (regenerable)
 /bench-output/
 /profiles/
+
+# OMO / OMC state dirs (local-only)
+/.omc/
+/.omo/
+/.codegraph/
