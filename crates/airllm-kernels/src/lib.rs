@@ -1,34 +1,27 @@
-//! Custom CUDA kernel dispatch for candle-core 0.11 missing narrow/stack/reshape.
+//! Custom CUDA kernel dispatch for candle-core 0.11 narrow/stack/reshape.
 //!
-//! ## Status (m0582 — honest end-of-session)
+//! ## T6.5 honest end-of-session (m0648)
 //!
-//! The FFI binding structure is in place (`ffi.rs` declares the `extern "C"`
-//! launchers matching `kernels/*.cu`). The Rust wrappers compile cleanly.
+//! Approach A (vendor-patch candle-core) and Approach B (bypass candle Tensor
+//! with cudarc::driver::CudaDevice::new(0)) both encountered API mismatches
+//! after 5+ iterations each. Reversed to placeholder (bail! on CUDA path,
+//! CPU passthrough unchanged). The cudarc 0.19 API path that worked in
+//! candle's own source (candle-nn/src/rotary_emb.rs) requires a fresh `Arc<CudaContext>`
+//! + `Arc<CudaStream>` shared with candle — not achievable from outside the
+//! candle crate without vendor-patching or an alternative cudarc 0.19 path
+//! that we couldn't identify in remaining context.
 //!
-//! **CUDA execution path is a no-op** because extracting the cudarc `Device`
-//! handle from candle's `CudaDevice` wrapper requires non-public candle
-//! internals (`inner()` method does not exist on `candle_core::CudaDevice`).
-//! This is a candle-core 0.11 API design choice — the wrapper is not
-//! intended to be unwrapped from outside.
+//! ## Path forward (T6.5 deferred, 2-4h dedicated session)
 //!
-//! ## Path forward (T6.5 deferred)
-//!
-//! 1. **Approach A**: vendor-patch candle-core to expose `inner()` on CudaDevice
-//!    (or implement the cudarc kernel launch via the existing `candle_kernels`
-//!    crate pattern that the candle team itself uses).
-//! 2. **Approach B**: bypass candle's Tensor wrapper for the CUDA path —
-//!    load PTX via cudarc directly, manage device pointers manually. Loses
-//!    candle's safe-Tensor handle but enables full custom kernel control.
-//! 3. **Approach C**: wait for candle 0.12+ to add the missing CUDA kernels
-//!    upstream (unlikely in near term; candle's own issue tracker has
-//!    `narrow CUDA kernel` open since 0.9).
-//!
-//! Both Approaches A and B are multi-hour work (1-3h each) with high
-//! debugging risk because they require understanding candle-core's internal
-//! storage abstractions deeply. The current PoC correctly establishes
-//! ALL the surrounding scaffolding (FFI signatures, dispatch shim, .cu
-//! source code with real math, PTX compiled and embedded) — only the
-//! final cudarc Device handle extraction is missing.
+//! 1. Read candle-nn/src/rotary_emb.rs (~150 LOC) to extract the canonical
+//!    pattern: candle keeps its own `Arc<CudaContext>` alive internally, and
+//!    the custom kernel API takes the cudarc Device+Stream. The path is to
+//!    use the `candle::CudaDevice` (the wrapper)'s public methods to get
+//!    `cuda_stream()` and a way to find the cudarc Device — and that path
+//!    doesn't exist publicly in 0.11. So vendor-patch is the only path.
+//! 2. Vendor-patch candle-core: add `pub fn cudarc_device(&self) -> cudarc::driver::CudaDevice`
+//!    that returns `CudaDevice::new(self.context.clone(), self.stream.clone(), self.id.as_index())`.
+//! 3. Re-vendor via [patch.crates-io] candle-core = { path = "vendor/candle-core" }.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -38,8 +31,7 @@ pub mod ffi;
 use anyhow::{Context, Result};
 use candle_core::{DType, Shape, Tensor};
 
-/// Narrow (slice along a dim) — public API. CPU passthrough to candle;
-/// CUDA returns clean error explaining the missing T6.5 step.
+/// Public API: narrow a tensor (CPU → candle built-in; CUDA → placeholder).
 pub fn narrow(
     t: &Tensor,
     dim: usize,
@@ -54,18 +46,13 @@ pub fn narrow(
 }
 
 fn narrow_cuda(_t: &Tensor, _dim: usize, _start: usize, _length: usize) -> Result<Tensor> {
-    // T6.5 deferred: extract cudarc Device from candle's CudaDevice wrapper.
-    // The wrapper doesn't expose `.inner()`, so launching our PTX kernel
-    // requires either vendoring candle-core or bypassing Tensor entirely
-    // (raw cudarc + manual device management).
     Err(anyhow::anyhow!(
-        "narrow_cuda: cudarc Device handle extraction from candle-core 0.11 \
-         CudaDevice wrapper is not exposed (T6.5 deferred). See \
-         crates/airllm-kernels/src/lib.rs comment for path forward."
+        "narrow_cuda: deferred (T6.5 reversed m0648). CPU passthrough works; \
+         for GPU, see AUDIT D0019/D0021/D0024."
     ))
 }
 
-/// Stack (concat along new dim).
+/// Public API: stack N tensors along new dim.
 pub fn stack(tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
     if tensors.is_empty() {
         return Err(anyhow::anyhow!("stack requires at least one tensor"));
@@ -81,11 +68,11 @@ pub fn stack(tensors: &[&Tensor], dim: usize) -> Result<Tensor> {
 
 fn stack_cuda(_tensors: &[&Tensor], _dim: usize) -> Result<Tensor> {
     Err(anyhow::anyhow!(
-        "stack_cuda: T6.5 deferred (see narrow_cuda comment)"
+        "stack_cuda: deferred (T6.5 reversed m0648)"
     ))
 }
 
-/// Reshape.
+/// Public API: reshape.
 pub fn reshape(t: &Tensor, shape: Shape) -> Result<Tensor> {
     if t.device().is_cuda() {
         reshape_cuda(t, &shape)
@@ -96,6 +83,6 @@ pub fn reshape(t: &Tensor, shape: Shape) -> Result<Tensor> {
 
 fn reshape_cuda(_t: &Tensor, _shape: &Shape) -> Result<Tensor> {
     Err(anyhow::anyhow!(
-        "reshape_cuda: T6.5 deferred (see narrow_cuda comment)"
+        "reshape_cuda: deferred (T6.5 reversed m0648)"
     ))
 }
